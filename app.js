@@ -1835,6 +1835,14 @@
 
     const quadStyleOptions = Object.entries(styleMap).sort((a,b)=>b[1]-a[1]).slice(0,30).map(e=>e[0]);
 
+    // "listens" here is the primary artist's total ListenBrainz plays across
+    // their whole catalog (ListenBrainz's own /popularity/artist endpoint —
+    // there's no per-release equivalent with usable coverage; the project's
+    // validation found release-level MusicBrainz matching at only 43% vs.
+    // 94.5%/92.6% at the artist level). Every record by the same artist
+    // therefore shares the same y-value here by design, not a bug — only
+    // "rarity" (x) varies per record. The chart draws a small deterministic
+    // jitter on top of this for legibility; see drawInsightCharts().
     const quadPoints = [];
     if(lbHasData){
       const searchLower = quadSearch.trim().toLowerCase();
@@ -1855,6 +1863,8 @@
         }
         quadPoints.push({
           title: `${r.artistDisplay} – ${r.title}`,
+          artistName: stripSuffix(pa.name),
+          recordId: r.id,
           rarity: e.communityWant / (e.communityHave + 1),
           listens: pop.listens
         });
@@ -2100,7 +2110,7 @@
         <div class="chart-grid" style="margin-top:6px;">
           <div class="chart-box wide">
             <h4>Rarity vs. streams</h4>
-            <p class="value-note" style="margin:-4px 0 12px;">${s.quadPoints.length} record${s.quadPoints.length===1?'':'s'} shown.</p>
+            <p class="value-note" style="margin:-4px 0 12px;">${s.quadPoints.length} record${s.quadPoints.length===1?'':'s'} shown. Streams are the <em>artist's</em> total ListenBrainz plays, not per record — ListenBrainz has no reliable per-release data, so albums by the same artist share one value and cluster on the same row (nudged apart slightly so they stay visible; hover a dot for the real number).</p>
             ${s.quadPoints.length ? `<canvas id="chartRarityStreams" style="height:420px;"></canvas>` : `<p class="value-note">Nothing matches that combination of filters.</p>`}
           </div>
           ${s.topStreamed.length ? `
@@ -2486,6 +2496,20 @@
     // lines through the median of the currently-filtered points and
     // labeling the four resulting quadrants, registered per-chart rather
     // than globally since it only makes sense on this one canvas.
+    //
+    // "listens" is per artist, not per release (see the comment in
+    // computeInsights() by quadPoints), so every record by a prolific
+    // artist plots at exactly the same y — without help that reads as a
+    // bug rather than a deliberate data-coverage tradeoff. jitterY() nudges
+    // the *drawn* position by a small, deterministic (same record -> same
+    // offset every render) amount so overlapping records stay visible as a
+    // cluster instead of one suspicious dot; the tooltip always reports the
+    // real, un-jittered number.
+    function jitterY(recordId, value){
+      const seed = Math.sin(recordId * 12.9898) * 43758.5453;
+      const frac = seed - Math.floor(seed); // deterministic pseudo-random in [0,1)
+      return value * (1 + (frac - 0.5) * 0.3); // ±15%
+    }
     if(s.quadPoints.length){
       const medRarity = s.quadMedianRarity, medListens = s.quadMedianListens;
       const quadrantBgPlugin = {
@@ -2519,7 +2543,10 @@
         type: 'scatter',
         data: {
           datasets: [{
-            data: s.quadPoints.map(p => ({ x: p.rarity, y: p.listens, title: p.title })),
+            data: s.quadPoints.map(p => ({
+              x: p.rarity, y: jitterY(p.recordId, p.listens),
+              title: p.title, artistName: p.artistName, realListens: p.listens
+            })),
             backgroundColor: 'rgba(216,165,29,0.55)',
             pointRadius: 4,
             pointHoverRadius: 6
@@ -2529,14 +2556,14 @@
           maintainAspectRatio: false,
           scales: {
             x: { type: 'logarithmic', title: { display:true, text:'Discogs rarity (want ÷ have) →', color:'#7c715a' } },
-            y: { type: 'logarithmic', title: { display:true, text:'Artist ListenBrainz plays →', color:'#7c715a' } }
+            y: { type: 'logarithmic', title: { display:true, text:"Artist's total ListenBrainz plays →", color:'#7c715a' } }
           },
           plugins: {
             legend: { display:false },
             tooltip: {
               callbacks: {
                 title: (items) => items[0]?.raw?.title || '',
-                label: (ctx) => `rarity ${ctx.raw.x.toFixed(2)} · ${Math.round(ctx.raw.y).toLocaleString()} plays`
+                label: (ctx) => `rarity ${ctx.raw.x.toFixed(2)} · ${ctx.raw.artistName}: ${Math.round(ctx.raw.realListens).toLocaleString()} plays total`
               }
             }
           }
