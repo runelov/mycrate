@@ -5,7 +5,7 @@
   let collection = [];            // your owned records
   let wantlist = [];               // your wantlist
   let filtered = [];
-  let filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+  let filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
   let genreMode = 'style';         // 'genre' | 'style' | 'both'
   let valueGenreMode = localStorage.getItem('mycrate:valueGenreMode') || 'genre';
   let valueDecadeMode = localStorage.getItem('mycrate:valueDecadeMode') || 'decade';
@@ -93,6 +93,7 @@
   const formatTabs = el('formatTabs');
   const genreTabs = el('genreTabs');
   const decadeTabs = el('decadeTabs');
+  const originTabs = el('originTabs');
   const genreGroupLabel = el('genreGroupLabel');
   const genreModeToggle = el('genreModeToggle');
   const clearFiltersBtn = el('clearFilters');
@@ -257,6 +258,11 @@
   // Applied at display time (not just at fetch time) so it fixes names in
   // already-cached records too, without requiring a Full Resync.
   function stripSuffix(name){ return (name||'').replace(/\s\(\d+\)$/,''); }
+  function flagEmoji(countryCode){
+    if(!countryCode || countryCode.length !== 2) return '';
+    const base = 127397; // regional indicator symbol offset from ASCII
+    return String.fromCodePoint(countryCode.charCodeAt(0)+base, countryCode.charCodeAt(1)+base);
+  }
   function cleanArtistDisplay(r){
     return (r.artists && r.artists.length ? r.artists.map(a=>stripSuffix(a.name)).join(', ') : null) || r.artistDisplay || 'Unknown artist';
   }
@@ -701,10 +707,26 @@
     return v.count ? ` · ~${fmtMoneyDisplay(v.sum, v.currency)} (${v.count} of ${v.total} priced)` : '';
   }
 
+  // Primary (non-Various) artist's total ListenBrainz plays for a record,
+  // or null if that artist isn't MB/LB-matched yet. Used for sorting and
+  // grouping — it's an artist-level number shared by every record from the
+  // same artist, same as everywhere else this data is used (see the
+  // comment by quadPoints in computeInsights() for why).
+  function getRecordPopularity(r){
+    const pa = r.artists.find(a => a.id && !isVariousArtist(a));
+    const pop = pa && lbPopularityCache[pa.id];
+    return (pop && typeof pop.listens === 'number') ? pop.listens : null;
+  }
+
   function groupKeyFor(r, mode){
     if(mode === 'artist') return cleanArtistDisplay(r);
     if(mode === 'year') return r.year ? String(r.year) : 'Unknown year';
     if(mode === 'label') return (r.labels[0] && r.labels[0].name) || 'Unknown label';
+    if(mode === 'origin'){
+      const pa = r.artists.find(a => a.id && !isVariousArtist(a));
+      const cc = pa && mbArtistCache[pa.id]?.country;
+      return cc ? `${flagEmoji(cc)} ${cc}` : 'Unknown origin';
+    }
     return null;
   }
 
@@ -725,6 +747,10 @@
     }
     if(filters.formatDesc && !matchesFormatMixValue(r, filters.formatDesc)) return false;
     if(filters.country && enrichCache[r.id]?.country !== filters.country) return false;
+    if(exclude!=='origin' && filters.origin){
+      const pa = r.artists.find(a => a.id && !isVariousArtist(a));
+      if(!pa || mbArtistCache[pa.id]?.country !== filters.origin) return false;
+    }
     if(filters.creditId != null && !(enrichCache[r.id]?.credits||[]).some(c=>c.id===filters.creditId)) return false;
     if(searchTerm){
       const hay = `${r.artistDisplay} ${r.title} ${r.labels.map(l=>l.name).join(' ')} ${r.catno} ${r.genres.join(' ')} ${r.styles.join(' ')}`.toLowerCase();
@@ -763,6 +789,20 @@
         }
         case 'value-asc': {
           const av=getItemValue(a)?.amount ?? null, bv=getItemValue(b)?.amount ?? null;
+          if(av==null && bv==null) return 0;
+          if(av==null) return 1;
+          if(bv==null) return -1;
+          return av-bv;
+        }
+        case 'popularity-desc': {
+          const av=getRecordPopularity(a), bv=getRecordPopularity(b);
+          if(av==null && bv==null) return 0;
+          if(av==null) return 1;
+          if(bv==null) return -1;
+          return bv-av;
+        }
+        case 'popularity-asc': {
+          const av=getRecordPopularity(a), bv=getRecordPopularity(b);
           if(av==null && bv==null) return 0;
           if(av==null) return 1;
           if(bv==null) return -1;
@@ -895,7 +935,7 @@
 
   function buildTabs(){
     const items = activeItems();
-    const formats = {}, decades = {}, genreMap = {};
+    const formats = {}, decades = {}, genreMap = {}, origins = {};
     items.forEach(r=>{
       if(matchesFilters(r, 'format')) [...new Set(r.formats)].forEach(f => formats[f] = (formats[f]||0)+1);
       if(matchesFilters(r, 'decade') && r.year){ const d = Math.floor(r.year/10)*10; decades[d] = (decades[d]||0)+1; }
@@ -906,11 +946,17 @@
         else source = r.genres.concat(r.styles);
         source.forEach(g => genreMap[g] = (genreMap[g]||0)+1);
       }
+      if(matchesFilters(r, 'origin')){
+        const pa = r.artists.find(a => a.id && !isVariousArtist(a));
+        const cc = pa && mbArtistCache[pa.id]?.country;
+        if(cc) origins[cc] = (origins[cc]||0)+1;
+      }
     });
     genreGroupLabel.textContent = genreMode === 'genre' ? 'Genre' : (genreMode === 'style' ? 'Style' : 'Genre & Style');
     formatTabs.innerHTML = tabsHtml(formats, filters.format);
     genreTabs.innerHTML = tabsHtml(genreMap, filters.genre);
     decadeTabs.innerHTML = tabsHtml(decades, filters.decade, v => v+'s');
+    originTabs.innerHTML = tabsHtml(origins, filters.origin, v => `${flagEmoji(v)} ${v}`);
 
     formatTabs.querySelectorAll('.tab').forEach(t=> t.addEventListener('click', ()=>{
       filters.format = (filters.format === t.dataset.val) ? null : t.dataset.val;
@@ -925,6 +971,11 @@
     decadeTabs.querySelectorAll('.tab').forEach(t=> t.addEventListener('click', ()=>{
       const v = Number(t.dataset.val);
       filters.decade = (filters.decade === v) ? null : v;
+      setInsightFilterChip(null);
+      buildTabs(); render(); closeFiltersDrawer();
+    }));
+    originTabs.querySelectorAll('.tab').forEach(t=> t.addEventListener('click', ()=>{
+      filters.origin = (filters.origin === t.dataset.val) ? null : t.dataset.val;
       setInsightFilterChip(null);
       buildTabs(); render(); closeFiltersDrawer();
     }));
@@ -1231,7 +1282,7 @@
     activeDataset = toWant ? 'wantlist' : 'crate';
     tabCrate.classList.toggle('active', !toWant);
     tabWant.classList.toggle('active', toWant);
-    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
     searchTerm = ''; searchInput.value = '';
     if(opts.genreModeValue){
       genreMode = opts.genreModeValue;
@@ -1259,7 +1310,7 @@
       chip.innerHTML = `Filtered from Insights: <b>${escapeHtml(label)}</b> <span class="chip-x" id="insightFilterClear">✕</span>`;
       const clearBtn = el('insightFilterClear');
       if(clearBtn) clearBtn.addEventListener('click', ()=>{
-        filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+        filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
         searchTerm = ''; searchInput.value = '';
         setInsightFilterChip(null);
         buildTabs(); render();
@@ -1268,6 +1319,31 @@
       chip.style.display = 'none';
       chip.innerHTML = '';
     }
+  }
+
+  // MusicBrainz/ListenBrainz summary for one artist — country + a
+  // popularity ranking against every other MB/LB-matched artist in the
+  // collection. Reads only caches phases 1/2 already populate; returns null
+  // (renders nothing) if this artist has no MB match at all yet.
+  function artistPopularityInfo(id){
+    const mb = mbArtistCache[id];
+    const pop = lbPopularityCache[id];
+    if(!mb && !pop) return null;
+    let rank = null, totalRanked = null;
+    if(pop && typeof pop.listens === 'number'){
+      const ranked = collectionArtistIds()
+        .map(aid => ({ aid, listens: lbPopularityCache[aid]?.listens }))
+        .filter(x => typeof x.listens === 'number')
+        .sort((a,b) => b.listens - a.listens);
+      totalRanked = ranked.length;
+      const idx = ranked.findIndex(x => x.aid === id);
+      if(idx >= 0) rank = idx + 1;
+    }
+    return {
+      country: mb?.country || null,
+      listens: (pop && typeof pop.listens === 'number') ? pop.listens : null,
+      rank, totalRanked
+    };
   }
 
   async function openArtistView(id, name){
@@ -1279,7 +1355,7 @@
     tabGaps.classList.remove('active');
     tabInsights.classList.remove('active');
     detailView.style.display = 'block';
-    renderDetailSkeleton(name);
+    renderDetailSkeleton(name, artistPopularityInfo(id));
     const inCrate = collection.filter(r=> r.artists.some(a=>a.id===id));
     const inWant = wantlist.filter(r=> r.artists.some(a=>a.id===id));
     renderDetailSections(inCrate, inWant);
@@ -1308,11 +1384,17 @@
     }catch(e){ /* leave loading note in place on failure */ }
   }
 
-  function renderDetailSkeleton(name){
+  function renderDetailSkeleton(name, mbInfo){
+    const mbLine = (mbInfo && (mbInfo.country || mbInfo.listens != null)) ? `
+      <div class="detail-mb-line">
+        ${mbInfo.country ? `<span>${flagEmoji(mbInfo.country)} ${escapeHtml(mbInfo.country)}</span>` : ''}
+        ${mbInfo.listens != null ? `<span>${mbInfo.listens.toLocaleString()} ListenBrainz plays${mbInfo.rank ? ` · ranked #${mbInfo.rank} of your ${mbInfo.totalRanked} artists` : ''}</span>` : ''}
+      </div>` : '';
     detailView.innerHTML = `
       <span class="back-link" id="backLink">← Back to crate</span>
       <div class="detail-header">
         <h2>${escapeHtml(name)}</h2>
+        ${mbLine}
         <div class="detail-bio" id="detailBio"><p class="detail-loading">Reading the sleeve notes…</p></div>
       </div>
       <div class="detail-section">
@@ -1395,7 +1477,13 @@
         const enrich = enrichCache[r.id];
         const rarity = (enrich && typeof enrich.communityHave === 'number' && typeof enrich.communityWant === 'number' && enrich.communityWant > 0)
           ? enrich.communityWant / (enrich.communityHave + 1) : null;
-        candidates.push({ r, artistName: g.name, lowest: market.lowest, lowestCurrency: market.currency || 'USD', estAmount: iv.amount, estCurrency: iv.currency, savingsRatio, numForSale: market.numForSale, rarity });
+        // Same signal "Hylle vs. ører" already plots in Insights (Discogs
+        // vinyl-scarcity vs. ListenBrainz artist-level plays), applied here
+        // to wantlist deals instead of the whole collection: hard to find
+        // on vinyl *and* clearly well-listened is a stronger "grab it" case
+        // than a discount alone.
+        const listens = lbPopularityCache[g.artistId]?.listens ?? null;
+        candidates.push({ r, artistName: g.name, lowest: market.lowest, lowestCurrency: market.currency || 'USD', estAmount: iv.amount, estCurrency: iv.currency, savingsRatio, numForSale: market.numForSale, rarity, listens });
       });
     });
     return candidates.sort((a,b)=> b.savingsRatio - a.savingsRatio).slice(0,10);
@@ -1524,7 +1612,7 @@
     const bestBuysHtml = bestBuys.length ? `
       <div class="best-buys">
         <h3>Best buys right now</h3>
-        <p class="detail-bio" style="margin:0 0 14px;">Ranked by how far below estimated value the current lowest listing sits. Run "Check for deals" above to populate this — only records with both a market listing and an estimated value can show up here. Where wantlist enrichment data is available (see Insights), rarity (want ÷ have) is shown too.</p>
+        <p class="detail-bio" style="margin:0 0 14px;">Ranked by how far below estimated value the current lowest listing sits. Run "Check for deals" above to populate this — only records with both a market listing and an estimated value can show up here. Where wantlist enrichment data is available (see Insights), rarity (want ÷ have) is shown too — and where the artist is matched to MusicBrainz/ListenBrainz, so is their total play count, with a ★ when both signals point the same way.</p>
         <div class="best-buys-grid">
           ${bestBuys.map(b=>`
             <div class="best-buy-item">
@@ -1532,6 +1620,7 @@
               <div class="best-buy-note">
                 <span class="best-buy-savings">${Math.round((b.savingsRatio-1)*100)}% below est. value</span>
                 ${b.rarity!=null ? `<span class="best-buy-rarity">${b.rarity.toFixed(1)}x want/have</span>` : ''}
+                ${b.listens!=null ? `<span class="best-buy-popular">${b.rarity!=null && b.rarity>1 ? '★ rare & loved — ' : ''}${Math.round(b.listens).toLocaleString()} plays</span>` : ''}
                 <span>Lowest: ${fmtMoney(b.lowest, b.lowestCurrency)} · Est: ${fmtMoneyDisplay(b.estAmount, b.estCurrency)} · ${b.numForSale} for sale</span>
               </div>
             </div>`).join('')}
@@ -2920,7 +3009,7 @@
     activeDataset = ds;
     tabCrate.classList.toggle('active', ds==='crate');
     tabWant.classList.toggle('active', ds==='wantlist');
-    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
     searchInput.value = ''; searchTerm = '';
     setInsightFilterChip(null);
     showBrowseView();
@@ -2998,7 +3087,7 @@
         : (newItems.length
             ? `Synced just now · <b>${newItems.length}</b> new record${newItems.length===1?'':'s'} found (now <b>${merged.length}</b> total).`
             : `No new records found · still <b>${merged.length}</b> total.`)) + enrichNote;
-      filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+      filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
       searchInput.value = ''; searchTerm = '';
       switchDataset('crate');
       refreshNav(); buildTabs(); updateValueBar(); render();
@@ -3432,7 +3521,7 @@
   filtersCloseBtn.addEventListener('click', closeFiltersDrawer);
 
   clearFiltersBtn.addEventListener('click', ()=>{
-    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null };
+    filters = { format:null, genre:null, decade:null, formatDesc:null, country:null, creditId:null, origin:null };
     setInsightFilterChip(null);
     buildTabs(); render();
     closeFiltersDrawer();
