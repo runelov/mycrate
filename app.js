@@ -20,6 +20,7 @@
   let marketCache = {};            // release id -> {numForSale, lowest, currency, fetchedAt}
   let enrichCache = {};            // release id -> {country, communityHave, communityWant, totalDurationSec, credits, fetchedAt}
   let mbArtistCache = {};          // discogs artist id -> {mbid, country, fetchedAt} | null (checked, no MusicBrainz match)
+  let lbPopularityCache = {};      // discogs artist id -> {listens, listeners, fetchedAt} | null (checked, no ListenBrainz data)
   let valuePassRunning = false;
   let valuePassCancelled = false;
   let valuePassForce = false;
@@ -28,6 +29,18 @@
   let mbDone = 0;
   let mbTotal = 0;
   let mbStatusMsg = '';
+  let lbPassRunning = false;
+  let lbPassCancelled = false;
+  let lbDone = 0;
+  let lbTotal = 0;
+  let lbStatusMsg = '';
+  // "Hylle vs. ører" chart's own small filter state — deliberately not the
+  // shared `filters`/`searchTerm` used by Browse, since the filter sidebar
+  // and search box are hidden while viewing Insights (see
+  // showInsightsView()) and so can't be reached from here anyway.
+  let quadStyle = '';
+  let quadSearch = '';
+  let quadMinValue = 0;
 
   const el = id => document.getElementById(id);
   const usernameInput = el('username');
@@ -160,6 +173,7 @@
     marketCache = (await idbGet('mycrate:market')) || {};
     enrichCache = (await idbGet('mycrate:enrich')) || {};
     mbArtistCache = (await idbGet('mycrate:mbArtist')) || {};
+    lbPopularityCache = (await idbGet('mycrate:lbPopularity')) || {};
     const savedCondition = loadJSON('mycrate:assumedCondition');
     if(savedCondition) assumedConditionSelect.value = savedCondition;
     displayCurrencySelect.value = displayCurrency;
@@ -178,6 +192,7 @@
   async function saveArtistCache(){ await idbSet('mycrate:artists', artistCache); }
   async function saveLabelCache(){ await idbSet('mycrate:labels', labelCache); }
   async function saveMbArtistCache(){ await idbSet('mycrate:mbArtist', mbArtistCache); }
+  async function saveLbPopularityCache(){ await idbSet('mycrate:lbPopularity', lbPopularityCache); }
 
   function fmtDate(iso){
     const d = new Date(iso);
@@ -592,6 +607,67 @@
     discogsArtistIds.forEach(id => { mbArtistCache[id] = found[id] || null; });
     await saveMbArtistCache();
     return found;
+  }
+
+  // ---------- ListenBrainz fetch (artist popularity) ----------
+  // A third rate-limit domain, separate from both Discogs and MusicBrainz —
+  // ListenBrainz publishes no hard per-second limit for this endpoint, but
+  // it still gets its own conservative pacer rather than assuming it's fine
+  // to hammer.
+  const LB_API = "https://api.listenbrainz.org/1";
+  const lbPace = { gapMs: 300, maxGapMs: 10000, lastRequestAt: 0 };
+
+  async function lbFetch(url, body){
+    const maxAttempts = 6;
+    let attempt = 0;
+    while(true){
+      const wait = lbPace.gapMs - (Date.now() - lbPace.lastRequestAt);
+      if(wait > 0) await new Promise(r=>setTimeout(r, wait));
+      let resp, networkFailed = false;
+      lbPace.lastRequestAt = Date.now();
+      try{
+        resp = await fetch(url, body ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        } : undefined);
+      }catch(err){ networkFailed = true; }
+      const isRateLimited = networkFailed || (resp && (resp.status === 429 || resp.status === 503));
+      if(isRateLimited && attempt < maxAttempts){
+        attempt++;
+        lbPace.gapMs = Math.min(lbPace.gapMs * 1.6, lbPace.maxGapMs);
+        await new Promise(r=>setTimeout(r, 1500));
+        continue;
+      }
+      if(networkFailed) throw new Error("Couldn't reach ListenBrainz after several retries.");
+      return resp;
+    }
+  }
+
+  // Batches Discogs artist ids that already carry a MusicBrainz MBID (from
+  // the MusicBrainz pass above — this can't run before that one) and asks
+  // ListenBrainz for total listen/listener counts. 100 per call — a smaller
+  // offline test confirmed batches of 200 work, kept at 100 here as margin
+  // since MAX_ITEMS_PER_GET isn't documented as a specific number. Artists
+  // with no MBID at all are left untouched in the cache rather than stored
+  // as null — there's nothing ListenBrainz could even be asked about them.
+  async function fetchLbPopularityBatch(discogsArtistIds){
+    const withMbid = discogsArtistIds
+      .map(id => ({ id, mbid: mbArtistCache[id]?.mbid }))
+      .filter(x => x.mbid);
+    if(!withMbid.length) return {};
+    const resp = await lbFetch(`${LB_API}/popularity/artist`, { artist_mbids: withMbid.map(x=>x.mbid) });
+    if(!resp.ok) throw new Error(`ListenBrainz returned an error (${resp.status}).`);
+    const data = await resp.json();
+    const byMbid = new Map(data.map(d => [d.artist_mbid, d]));
+    withMbid.forEach(({id, mbid}) => {
+      const d = byMbid.get(mbid);
+      lbPopularityCache[id] = (d && typeof d.total_listen_count === 'number')
+        ? { listens: d.total_listen_count, listeners: d.total_user_count, fetchedAt: Date.now() }
+        : null;
+    });
+    await saveLbPopularityCache();
+    return byMbid;
   }
 
   // ---------- data access ----------
@@ -1747,6 +1823,64 @@
       }
     });
 
+    // ListenBrainz popularity — only asked about artists the MusicBrainz
+    // pass above already matched to an MBID. The "Hylle vs. ører" scatter
+    // respects quadStyle/quadSearch/quadMinValue, the chart's own small
+    // local filter state (see the comment by their declaration for why
+    // they aren't the shared Browse filters).
+    const lbEligibleIds = mbArtistIds.filter(id => mbArtistCache[id]?.mbid);
+    const lbEligible = lbEligibleIds.length;
+    const lbChecked = lbEligibleIds.filter(id => lbPopularityCache[id] !== undefined).length;
+    const lbHasData = lbEligibleIds.filter(id => lbPopularityCache[id]).length;
+
+    const quadStyleOptions = Object.entries(styleMap).sort((a,b)=>b[1]-a[1]).slice(0,30).map(e=>e[0]);
+
+    const quadPoints = [];
+    if(lbHasData){
+      const searchLower = quadSearch.trim().toLowerCase();
+      collection.forEach(r => {
+        const e = enrichCache[r.id];
+        if(!e || typeof e.communityHave !== 'number' || typeof e.communityWant !== 'number' || e.communityWant <= 0) return;
+        const pa = r.artists.find(a => a.id && !isVariousArtist(a));
+        const pop = pa && lbPopularityCache[pa.id];
+        if(!pop || !pop.listens) return; // 0 listens can't sit on a log scale
+        if(quadStyle && !r.styles.includes(quadStyle)) return;
+        if(searchLower){
+          const hay = `${r.artistDisplay} ${r.labels.map(l=>l.name).join(' ')}`.toLowerCase();
+          if(!hay.includes(searchLower)) return;
+        }
+        if(quadMinValue){
+          const iv = getItemValue(r);
+          if(!iv || iv.amount < quadMinValue) return;
+        }
+        quadPoints.push({
+          title: `${r.artistDisplay} – ${r.title}`,
+          rarity: e.communityWant / (e.communityHave + 1),
+          listens: pop.listens
+        });
+      });
+    }
+    let quadMedianRarity = null, quadMedianListens = null;
+    if(quadPoints.length){
+      const rs = quadPoints.map(p=>p.rarity).sort((a,b)=>a-b);
+      const ls = quadPoints.map(p=>p.listens).sort((a,b)=>a-b);
+      quadMedianRarity = rs[Math.floor(rs.length/2)];
+      quadMedianListens = ls[Math.floor(ls.length/2)];
+    }
+
+    // Most/least streamed artists — whole collection, not affected by the
+    // chart's local filters above, same convention as the other Insights
+    // leaderboards (topValuable etc. also ignore active state elsewhere).
+    const streamedArtists = [];
+    artistMap.forEach((info, id) => {
+      const pop = lbPopularityCache[id];
+      if(pop) streamedArtists.push({ name: info.name, listens: pop.listens, listeners: pop.listeners });
+    });
+    streamedArtists.sort((a,b)=> b.listens - a.listens);
+    const topStreamed = streamedArtists.slice(0, 8);
+    const bottomPool = streamedArtists.length > 8 ? streamedArtists.slice(8) : [];
+    const bottomStreamed = bottomPool.slice(-8).reverse();
+
     return {
       total: collection.length,
       artistCount: artistMap.size,
@@ -1761,7 +1895,9 @@
       enrichedCount, totalDurationSec, medianHave, medianWant, countryMap, topCredits, topRarityGems,
       enrichedWantCount, topWantRarityGems,
       artistMapAll: artistMap, labelMapAll: labelMap, yearCounts,
-      mbArtistTotal, mbArtistMatched, originCountryMap, originMatchedRecords
+      mbArtistTotal, mbArtistMatched, originCountryMap, originMatchedRecords,
+      lbEligible, lbChecked, lbHasData, quadStyleOptions, quadPoints, quadMedianRarity, quadMedianListens,
+      topStreamed, bottomStreamed
     };
   }
 
@@ -1939,6 +2075,52 @@
         </div>` : ''}
       </div>`;
 
+    const lbValueTiers = [0, 25, 50, 100, 250];
+    const lbHtml = `
+      <div class="insight-section">
+        <h3>Hylle vs. ører</h3>
+        <div class="enrich-panel">
+          <div class="txt">Discogs' have/want ratio measures vinyl scarcity. ListenBrainz measures actual listening — a different economy entirely. ${s.mbArtistMatched ? '' : 'Run "Match artists to MusicBrainz" above first — this needs it.'}</div>
+          <div class="progress" id="lbProgress">${lbPassRunning ? `Checking artists — batch reaching ${lbDone} of ${lbTotal}…` : lbStatusMsg}</div>
+          <button class="btn small${lbPassRunning ? ' running' : ''}" id="lbBtn"${s.mbArtistMatched ? '' : ' disabled'}>${lbPassRunning ? `⏹ Stop (${lbDone} of ${lbTotal})` : (s.lbHasData ? 'Check more popularity' : 'Check ListenBrainz popularity')}</button>
+          <button class="btn ghost small" id="lbRefreshBtn"${s.mbArtistMatched ? '' : ' disabled'}>Refresh all</button>
+        </div>
+        ${s.lbHasData ? `
+        <p class="value-note" style="margin:12px 0 10px;">${s.lbHasData} of ${s.lbEligible} MusicBrainz-matched artists have ListenBrainz data.</p>
+        <div class="quad-filters">
+          <select id="quadStyleSelect">
+            <option value="">All styles</option>
+            ${s.quadStyleOptions.map(st=>`<option value="${escapeHtml(st)}"${quadStyle===st?' selected':''}>${escapeHtml(st)}</option>`).join('')}
+          </select>
+          <input type="text" id="quadSearchInput" placeholder="Search artist or label…" value="${escapeHtml(quadSearch)}">
+          <select id="quadValueSelect">
+            ${lbValueTiers.map(v=>`<option value="${v}"${quadMinValue===v?' selected':''}>${v===0?'All values':`Over $${v}`}</option>`).join('')}
+          </select>
+        </div>
+        <div class="chart-grid" style="margin-top:6px;">
+          <div class="chart-box wide">
+            <h4>Rarity vs. streams</h4>
+            <p class="value-note" style="margin:-4px 0 12px;">${s.quadPoints.length} record${s.quadPoints.length===1?'':'s'} shown.</p>
+            ${s.quadPoints.length ? `<canvas id="chartRarityStreams" style="height:420px;"></canvas>` : `<p class="value-note">Nothing matches that combination of filters.</p>`}
+          </div>
+          ${s.topStreamed.length ? `
+          <div class="chart-box wide">
+            <h4>Most and least streamed artists</h4>
+            <div class="leaderboard-split">
+              <table class="leaderboard">
+                <thead><tr><th>Most streamed</th><th style="text-align:right;">Plays</th></tr></thead>
+                <tbody>${s.topStreamed.map(a=>`<tr><td>${escapeHtml(a.name)}</td><td class="num">${a.listens.toLocaleString()}</td></tr>`).join('')}</tbody>
+              </table>
+              ${s.bottomStreamed.length ? `
+              <table class="leaderboard">
+                <thead><tr><th>Least streamed</th><th style="text-align:right;">Plays</th></tr></thead>
+                <tbody>${s.bottomStreamed.map(a=>`<tr><td>${escapeHtml(a.name)}</td><td class="num">${a.listens.toLocaleString()}</td></tr>`).join('')}</tbody>
+              </table>` : ''}
+            </div>
+          </div>` : ''}
+        </div>` : ''}
+      </div>`;
+
     const chartsHtml = `
       <div class="insight-section">
         <h3>The shape of your crate</h3>
@@ -2054,6 +2236,7 @@
       <div class="stat-cards">${statCardsHtml}</div>
       ${enrichHtml}
       ${mbHtml}
+      ${lbHtml}
       ${chartsHtml}
       ${valueSection}
       ${enrichedSection}
@@ -2064,6 +2247,14 @@
     el('enrichRefreshBtn').addEventListener('click', ()=> runEnrichPass(true));
     el('mbBtn').addEventListener('click', ()=> runMbPass(false));
     el('mbRefreshBtn').addEventListener('click', ()=> runMbPass(true));
+    el('lbBtn').addEventListener('click', ()=> runLbPass(false));
+    el('lbRefreshBtn').addEventListener('click', ()=> runLbPass(true));
+    const quadStyleSel = el('quadStyleSelect');
+    if(quadStyleSel) quadStyleSel.addEventListener('change', (e)=>{ quadStyle = e.target.value; renderInsightsView(); });
+    const quadSearchInp = el('quadSearchInput');
+    if(quadSearchInp) quadSearchInp.addEventListener('change', (e)=>{ quadSearch = e.target.value; renderInsightsView(); });
+    const quadValueSel = el('quadValueSelect');
+    if(quadValueSel) quadValueSel.addEventListener('change', (e)=>{ quadMinValue = Number(e.target.value)||0; renderInsightsView(); });
     if(el('enrichWantBtn')){
       el('enrichWantBtn').addEventListener('click', ()=> runEnrichWantPass(false));
       el('enrichWantRefreshBtn').addEventListener('click', ()=> runEnrichWantPass(true));
@@ -2287,6 +2478,72 @@
         }
       });
     }
+
+    // Rarity vs. streams — Discogs vinyl-scarcity on one axis, ListenBrainz
+    // artist-level plays on the other, both log-scaled since both span many
+    // orders of magnitude. Chart.js' built-in scatter type does the actual
+    // plotting; the only custom part is a small plugin drawing crosshair
+    // lines through the median of the currently-filtered points and
+    // labeling the four resulting quadrants, registered per-chart rather
+    // than globally since it only makes sense on this one canvas.
+    if(s.quadPoints.length){
+      const medRarity = s.quadMedianRarity, medListens = s.quadMedianListens;
+      const quadrantBgPlugin = {
+        id: 'quadrantBg',
+        beforeDatasetsDraw(chart){
+          const { ctx, chartArea, scales } = chart;
+          if(!chartArea) return;
+          const xPix = scales.x.getPixelForValue(medRarity);
+          const yPix = scales.y.getPixelForValue(medListens);
+          ctx.save();
+          ctx.strokeStyle = 'rgba(236,227,206,0.15)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(xPix, chartArea.top); ctx.lineTo(xPix, chartArea.bottom);
+          ctx.moveTo(chartArea.left, yPix); ctx.lineTo(chartArea.right, yPix);
+          ctx.stroke();
+          ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = 'rgba(222,210,180,0.5)';
+          ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+          ctx.fillText('MAINSTREAM HIT', chartArea.left + 8, chartArea.top + 8);
+          ctx.textAlign = 'right';
+          ctx.fillText('VINYL-RARE CLASSIC', chartArea.right - 8, chartArea.top + 8);
+          ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+          ctx.fillText('FORGOTTEN', chartArea.left + 8, chartArea.bottom - 8);
+          ctx.textAlign = 'right';
+          ctx.fillText('DEEP CUT', chartArea.right - 8, chartArea.bottom - 8);
+          ctx.restore();
+        }
+      };
+      makeChart('chartRarityStreams', {
+        type: 'scatter',
+        data: {
+          datasets: [{
+            data: s.quadPoints.map(p => ({ x: p.rarity, y: p.listens, title: p.title })),
+            backgroundColor: 'rgba(216,165,29,0.55)',
+            pointRadius: 4,
+            pointHoverRadius: 6
+          }]
+        },
+        options: {
+          maintainAspectRatio: false,
+          scales: {
+            x: { type: 'logarithmic', title: { display:true, text:'Discogs rarity (want ÷ have) →', color:'#7c715a' } },
+            y: { type: 'logarithmic', title: { display:true, text:'Artist ListenBrainz plays →', color:'#7c715a' } }
+          },
+          plugins: {
+            legend: { display:false },
+            tooltip: {
+              callbacks: {
+                title: (items) => items[0]?.raw?.title || '',
+                label: (ctx) => `rarity ${ctx.raw.x.toFixed(2)} · ${Math.round(ctx.raw.y).toLocaleString()} plays`
+              }
+            }
+          }
+        },
+        plugins: [quadrantBgPlugin]
+      });
+    }
   }
 
   let enrichPassRunning = false, enrichPassCancelled = false, enrichDone = 0, enrichTotal = 0;
@@ -2478,6 +2735,49 @@
     updateSetupToggleLabel();
   }
 
+  // ---------- ListenBrainz enrichment (artist popularity) ----------
+  // Can only run against artists the MusicBrainz pass above has already
+  // matched — there's no MBID to ask ListenBrainz about otherwise. The
+  // button in Insights is disabled until at least one artist is matched.
+  async function runLbPass(force){
+    if(lbPassRunning){ lbPassCancelled = true; return; }
+    const matchedIds = collectionArtistIds().filter(id => mbArtistCache[id]?.mbid);
+    const ids = force ? matchedIds : matchedIds.filter(id => lbPopularityCache[id] === undefined);
+    if(force){
+      const ok = await showConfirm(`This re-checks ListenBrainz for all <b>${matchedIds.length}</b> MusicBrainz-matched artists, even ones already checked.`, { title:'Refresh all ListenBrainz data?', confirmLabel:'Refresh all' });
+      if(!ok) return;
+    }
+    lbPassRunning = true; lbPassCancelled = false;
+    lbDone = 0; lbTotal = ids.length;
+    updateLbButton();
+    let erroredMessage = null;
+    for(let i = 0; i < ids.length; i += 100){
+      if(lbPassCancelled) break;
+      const batch = ids.slice(i, i + 100);
+      try{ await fetchLbPopularityBatch(batch); }
+      catch(err){ erroredMessage = err.message; break; }
+      lbDone = Math.min(ids.length, i + batch.length);
+      updateLbButton();
+      if(currentView.type === 'insights') renderInsightsView();
+    }
+    lbPassRunning = false;
+    if(erroredMessage) lbStatusMsg = `Stopped after an error (${lbDone} checked first): ${erroredMessage}`;
+    else if(lbPassCancelled) lbStatusMsg = 'Stopped — click again to resume.';
+    else lbStatusMsg = ids.length ? `Done — checked ${lbDone} artist${lbDone===1?'':'s'}.` : 'Nothing new to check.';
+    updateSetupToggleLabel();
+    if(currentView.type === 'insights') renderInsightsView();
+  }
+  function updateLbButton(){
+    const btn = el('lbBtn');
+    const p = el('lbProgress');
+    if(btn){
+      btn.textContent = lbPassRunning ? `⏹ Stop (${lbDone} of ${lbTotal})` : 'Check ListenBrainz popularity';
+      btn.classList.toggle('running', lbPassRunning);
+    }
+    if(p && lbPassRunning) p.textContent = `Checking artists — batch reaching ${lbDone} of ${lbTotal}…`;
+    updateSetupToggleLabel();
+  }
+
   // ---------- value pass (opt-in background pricing) ----------
   function updateValueBar(){
     const items = activeItems();
@@ -2574,6 +2874,7 @@
     if(enrichPassRunning) label += ` · enriching crate ${enrichDone}/${enrichTotal}`;
     if(enrichWantPassRunning) label += ` · enriching wantlist ${enrichWantDone}/${enrichWantTotal}`;
     if(mbPassRunning) label += ` · matching artists ${mbDone}/${mbTotal}`;
+    if(lbPassRunning) label += ` · checking popularity ${lbDone}/${lbTotal}`;
     setupToggleLabel.textContent = label;
   }
   setupToggle.addEventListener('click', ()=>{
@@ -2753,13 +3054,14 @@
     await idbDelete('mycrate:market');
     await idbDelete('mycrate:enrich');
     await idbDelete('mycrate:mbArtist');
+    await idbDelete('mycrate:lbPopularity');
     // Clean up any leftovers from before these moved to IndexedDB.
     localStorage.removeItem('mycrate:prices');
     localStorage.removeItem('mycrate:artists');
     localStorage.removeItem('mycrate:labels');
     localStorage.removeItem('mycrate:market');
     localStorage.removeItem('mycrate:enrich');
-    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {};
+    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {};
     refreshNav();
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
   });
@@ -2778,6 +3080,7 @@
       labels: labelCache,
       enrich: enrichCache,
       mbArtist: mbArtistCache,
+      lbPopularity: lbPopularityCache,
       assumedCondition: assumedConditionSelect.value
     };
   }
@@ -2812,6 +3115,7 @@
     if(!(await idbSetSafe('mycrate:labels', payload.labels || {}))) failures.push('label bios');
     if(!(await idbSetSafe('mycrate:enrich', payload.enrich || {}))) failures.push('enrichment data (playtime/credits/country)');
     if(!(await idbSetSafe('mycrate:mbArtist', payload.mbArtist || {}))) failures.push('MusicBrainz artist matches');
+    if(!(await idbSetSafe('mycrate:lbPopularity', payload.lbPopularity || {}))) failures.push('ListenBrainz popularity data');
     if(payload.assumedCondition) saveJSON('mycrate:assumedCondition', payload.assumedCondition);
     localStorage.setItem('mycrate:lastUser', payload.username);
     return { failures, crateCount, wantCount };

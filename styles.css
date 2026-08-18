@@ -519,6 +519,15 @@
   .leaderboard td.num{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace; color:var(--mustard); text-align:right; }
   .leaderboard tr:hover td{ background:rgba(216,165,29,0.05); }
 
+  .quad-filters{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:12px 0 18px; }
+  .quad-filters input[type="text"]{
+    background:var(--ink-soft); color:var(--paper); border:1px solid var(--line-soft);
+    padding:9px 12px; border-radius:var(--radius); font-size:12px; min-width:180px;
+  }
+  .quad-filters input[type="text"]:focus{ border-color:var(--mustard); outline:none; }
+  .leaderboard-split{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width:640px){ .leaderboard-split{ grid-template-columns:1fr; } }
+
   @media (max-width:760px){
     header.top{ padding-top:calc(14px + env(safe-area-inset-top)); padding-bottom:10px; }
     .brand h1{ font-size:26px; }
