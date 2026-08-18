@@ -400,6 +400,11 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;
     font-size:11.5px; color:var(--mustard);
   }
+  .detail-related{ display:flex; align-items:center; flex-wrap:wrap; margin:0 0 16px; }
+  .detail-related-label{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;
+    font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--line); margin-right:8px;
+  }
   .detail-bio{
     max-width:760px; color:var(--paper-dim); font-size:13.5px; line-height:1.7; margin-bottom:8px;
   }
@@ -455,6 +460,23 @@
   .best-buy-savings{ display:block; color:var(--mustard); font-weight:600; font-size:11.5px; margin-bottom:2px; }
   .best-buy-rarity{ display:block; color:var(--rust); font-weight:600; font-size:10.5px; margin-bottom:2px; }
   .best-buy-popular{ display:block; color:var(--moss); font-weight:600; font-size:10.5px; margin-bottom:2px; }
+  .discog-section{
+    background:var(--ink-soft); border:1px solid var(--line-soft); border-radius:var(--radius);
+    padding:20px 22px; margin:0 0 32px;
+  }
+  .discog-section h3{ margin:0 0 6px; }
+  .discog-artists{ display:grid; grid-template-columns:repeat(auto-fill, minmax(280px,1fr)); gap:20px; margin-top:16px; }
+  .discog-artist{ background:var(--ink); border:1px solid var(--line-soft); border-radius:var(--radius); padding:14px 16px; }
+  .discog-artist h4{
+    margin:0 0 10px; font-size:14px; color:var(--paper); cursor:pointer;
+  }
+  .discog-artist h4:hover{ color:var(--mustard); }
+  .discog-row{ margin-bottom:10px; }
+  .discog-row:last-child{ margin-bottom:0; }
+  .discog-row-head{ display:flex; justify-content:space-between; font-size:11.5px; color:var(--paper-dim); margin-bottom:4px; }
+  .bar{ height:6px; border-radius:var(--radius); background:var(--line-soft); overflow:hidden; }
+  .bar i{ display:block; height:100%; background:var(--mustard); }
+  .discog-missing{ font-size:10.5px; color:var(--line); margin-top:4px; line-height:1.5; }
   .gap-deal{
     margin-top:10px; font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace; color:var(--line);
     border-top:1px dashed var(--line-soft); padding-top:8px;
@@ -499,6 +521,19 @@
   .chart-box canvas{ max-height:280px; }
   .chart-tall-wrap{ position:relative; width:100%; }
   .chart-tall-wrap canvas{ max-height:none; }
+  .network-box{
+    position:relative; width:100%; min-width:480px; height:440px;
+    background:var(--ink-soft); border:1px solid var(--line-soft); border-radius:var(--radius);
+    overflow-x:auto;
+  }
+  .network-box canvas{ position:absolute; inset:0; width:100%; height:100%; max-height:none; cursor:pointer; }
+  .network-tooltip{
+    position:absolute; pointer-events:none; z-index:5;
+    background:var(--ink); border:1px solid var(--line-soft); color:var(--paper);
+    font-size:11.5px; line-height:1.5; padding:8px 10px; border-radius:var(--radius);
+    max-width:230px; box-shadow:0 4px 14px rgba(0,0,0,0.4);
+  }
+  .network-tooltip b{ color:var(--mustard); }
   .timeline-cutoff-ctrl{
     font-size:10.5px; font-weight:400; text-transform:none; letter-spacing:0; color:var(--line);
     display:flex; align-items:center; gap:6px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;

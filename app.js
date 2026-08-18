@@ -21,6 +21,8 @@
   let enrichCache = {};            // release id -> {country, communityHave, communityWant, totalDurationSec, credits, fetchedAt}
   let mbArtistCache = {};          // discogs artist id -> {mbid, country, fetchedAt} | null (checked, no MusicBrainz match)
   let lbPopularityCache = {};      // discogs artist id -> {listens, listeners, fetchedAt} | null (checked, no ListenBrainz data)
+  let mbRelationsCache = {};       // discogs artist id -> {mbid, name, edges:[{type,otherMbid,otherName}], fetchedAt} | null
+  let mbDiscographyCache = {};     // discogs artist id -> {releaseGroups:[{mbid,title,type,secondaryTypes,firstReleaseDate}], fetchedAt} | null
   let valuePassRunning = false;
   let valuePassCancelled = false;
   let valuePassForce = false;
@@ -34,6 +36,16 @@
   let lbDone = 0;
   let lbTotal = 0;
   let lbStatusMsg = '';
+  let relPassRunning = false;
+  let relPassCancelled = false;
+  let relDone = 0;
+  let relTotal = 0;
+  let relStatusMsg = '';
+  let discogPassRunning = false;
+  let discogPassCancelled = false;
+  let discogDone = 0;
+  let discogTotal = 0;
+  let discogStatusMsg = '';
   // "Hylle vs. ører" chart's own small filter state — deliberately not the
   // shared `filters`/`searchTerm` used by Browse, since the filter sidebar
   // and search box are hidden while viewing Insights (see
@@ -175,6 +187,8 @@
     enrichCache = (await idbGet('mycrate:enrich')) || {};
     mbArtistCache = (await idbGet('mycrate:mbArtist')) || {};
     lbPopularityCache = (await idbGet('mycrate:lbPopularity')) || {};
+    mbRelationsCache = (await idbGet('mycrate:mbRelations')) || {};
+    mbDiscographyCache = (await idbGet('mycrate:mbDiscography')) || {};
     const savedCondition = loadJSON('mycrate:assumedCondition');
     if(savedCondition) assumedConditionSelect.value = savedCondition;
     displayCurrencySelect.value = displayCurrency;
@@ -194,6 +208,8 @@
   async function saveLabelCache(){ await idbSet('mycrate:labels', labelCache); }
   async function saveMbArtistCache(){ await idbSet('mycrate:mbArtist', mbArtistCache); }
   async function saveLbPopularityCache(){ await idbSet('mycrate:lbPopularity', lbPopularityCache); }
+  async function saveMbRelationsCache(){ await idbSet('mycrate:mbRelations', mbRelationsCache); }
+  async function saveMbDiscographyCache(){ await idbSet('mycrate:mbDiscography', mbDiscographyCache); }
 
   function fmtDate(iso){
     const d = new Date(iso);
@@ -613,6 +629,45 @@
     discogsArtistIds.forEach(id => { mbArtistCache[id] = found[id] || null; });
     await saveMbArtistCache();
     return found;
+  }
+
+  // Fetches one artist's relationships to *other artists* (member of band,
+  // founder, collaboration, ...) — a different relation set than the
+  // "discogs" link used above, and not batchable the way url lookups are:
+  // one MBID, one request. Keeps only edges pointing at another artist;
+  // relations to labels/works/etc. aren't relevant here.
+  async function fetchMbArtistRelations(discogsArtistId, mbid, name){
+    const resp = await mbFetch(`${MB_API}/artist/${mbid}?inc=artist-rels&fmt=json`);
+    if(!resp.ok) throw new Error(`MusicBrainz returned an error (${resp.status}).`);
+    const data = await resp.json();
+    const edges = (data.relations || [])
+      .filter(rel => rel['target-type'] === 'artist' && rel.artist)
+      .map(rel => ({ type: rel.type, otherMbid: rel.artist.id, otherName: rel.artist.name }));
+    mbRelationsCache[discogsArtistId] = { mbid, name, edges, fetchedAt: Date.now() };
+    await saveMbRelationsCache();
+    return edges;
+  }
+
+  // Fetches one artist's release-groups (studio albums / EPs / live albums
+  // / compilations, per MusicBrainz' own primary+secondary type system —
+  // stricter than Discogs' format field). Also one MBID per request. Capped
+  // at the first 100 — plenty for almost anyone, but a handful of
+  // extremely prolific artists (Merzbow-scale discographies) have more;
+  // the count shown will just reflect that rather than paginating further.
+  async function fetchArtistDiscography(discogsArtistId, mbid){
+    const resp = await mbFetch(`${MB_API}/release-group?artist=${mbid}&limit=100&fmt=json`);
+    if(!resp.ok) throw new Error(`MusicBrainz returned an error (${resp.status}).`);
+    const data = await resp.json();
+    const releaseGroups = (data['release-groups'] || []).map(rg => ({
+      mbid: rg.id,
+      title: rg.title,
+      type: rg['primary-type'] || null,
+      secondaryTypes: rg['secondary-types'] || [],
+      firstReleaseDate: rg['first-release-date'] || null
+    }));
+    mbDiscographyCache[discogsArtistId] = { releaseGroups, fetchedAt: Date.now() };
+    await saveMbDiscographyCache();
+    return releaseGroups;
   }
 
   // ---------- ListenBrainz fetch (artist popularity) ----------
@@ -1328,7 +1383,8 @@
   function artistPopularityInfo(id){
     const mb = mbArtistCache[id];
     const pop = lbPopularityCache[id];
-    if(!mb && !pop) return null;
+    const rel = mbRelationsCache[id];
+    if(!mb && !pop && !rel) return null;
     let rank = null, totalRanked = null;
     if(pop && typeof pop.listens === 'number'){
       const ranked = collectionArtistIds()
@@ -1339,10 +1395,14 @@
       const idx = ranked.findIndex(x => x.aid === id);
       if(idx >= 0) rank = idx + 1;
     }
+    // Only from the "Hvem kjenner hvem" pass in Insights, which only ever
+    // runs for the top REL_TOP_N owned artists — most artist pages simply
+    // won't have this yet, same as any other opt-in-pass data.
+    const related = (rel && rel.edges.length) ? rel.edges.slice(0, 10) : null;
     return {
       country: mb?.country || null,
       listens: (pop && typeof pop.listens === 'number') ? pop.listens : null,
-      rank, totalRanked
+      rank, totalRanked, related
     };
   }
 
@@ -1390,11 +1450,17 @@
         ${mbInfo.country ? `<span>${flagEmoji(mbInfo.country)} ${escapeHtml(mbInfo.country)}</span>` : ''}
         ${mbInfo.listens != null ? `<span>${mbInfo.listens.toLocaleString()} ListenBrainz plays${mbInfo.rank ? ` · ranked #${mbInfo.rank} of your ${mbInfo.totalRanked} artists` : ''}</span>` : ''}
       </div>` : '';
+    const relatedHtml = (mbInfo && mbInfo.related) ? `
+      <div class="detail-related">
+        <span class="detail-related-label">Related:</span>
+        ${mbInfo.related.map(r=>`<span class="tag" title="${escapeHtml(r.type)}">${escapeHtml(r.otherName)}</span>`).join('')}
+      </div>` : '';
     detailView.innerHTML = `
       <span class="back-link" id="backLink">← Back to crate</span>
       <div class="detail-header">
         <h2>${escapeHtml(name)}</h2>
         ${mbLine}
+        ${relatedHtml}
         <div class="detail-bio" id="detailBio"><p class="detail-loading">Reading the sleeve notes…</p></div>
       </div>
       <div class="detail-section">
@@ -1491,6 +1557,47 @@
 
   function isVariousArtist(a){
     return a.id === 194 || /^various(\s+artists)?$/i.test((a.name||'').trim());
+  }
+
+  // Matches owned release titles against MusicBrainz release-group titles
+  // by normalized string comparison, not MBID-to-MBID — a real, documented
+  // simplification. Production-grade matching would need each owned
+  // release's *own* MBID too (a separate crosswalk from the artist-level
+  // one this whole feature otherwise runs on, and one with much weaker
+  // ~43% coverage per the original research spike), so title-matching is
+  // what actually ships; it's approximate, not exact, and says so in the UI.
+  function normTitle(s){ return (s||'').toLowerCase().replace(/[^a-z0-9]/g,''); }
+
+  function computeDiscographyBreakdown(){
+    const counts = ownedArtistCounts();
+    const results = [];
+    Object.entries(mbDiscographyCache).forEach(([id, info]) => {
+      if(!info || !info.releaseGroups) return;
+      const oc = counts.get(id);
+      if(!oc || oc.count < gapMinOwned) return; // stay in sync if the threshold changed since this artist was fetched
+      const ownedTitles = collection
+        .filter(r => r.artists.some(a => String(a.id) === id))
+        .map(r => normTitle(r.title));
+      const classify = rg => {
+        if(rg.secondaryTypes.includes('Live')) return 'live';
+        if(rg.secondaryTypes.includes('Compilation')) return 'compilation';
+        if(rg.type === 'EP') return 'ep';
+        if(rg.type === 'Album') return 'studio';
+        return null;
+      };
+      const buckets = { studio:[], live:[], compilation:[], ep:[] };
+      info.releaseGroups.forEach(rg => {
+        const kind = classify(rg);
+        if(!kind) return;
+        const nt = normTitle(rg.title);
+        const owned = ownedTitles.some(ot => ot && (ot === nt || ot.includes(nt) || nt.includes(ot)));
+        buckets[kind].push({ title: rg.title, year: rg.firstReleaseDate ? rg.firstReleaseDate.slice(0,4) : null, owned });
+      });
+      if(!Object.values(buckets).some(b => b.length)) return;
+      results.push({ id, name: oc.name, buckets });
+    });
+    results.sort((a,b) => a.name.localeCompare(b.name));
+    return results;
   }
 
   function computeGaps(){
@@ -1627,11 +1734,50 @@
         </div>
       </div>` : '';
 
+    // Unlike everything else on this page, "gaps" here means the artist's
+    // *actual* discography (via MusicBrainz release-groups), not just
+    // what's already on your wantlist — so it can surface studio albums
+    // you never knew existed, not only ones you already flagged wanting.
+    const discogBreakdown = computeDiscographyBreakdown();
+    const hasAnyMbMatch = Object.values(mbArtistCache).some(v => v?.mbid);
+    const discogLabels = { studio:'Studio albums', ep:'EPs', live:'Live albums', compilation:'Compilations' };
+    const discogHtml = `
+      <div class="discog-section">
+        <h3>Diskografi-fullstendighet</h3>
+        <p class="detail-bio" style="margin:0 0 14px;">MusicBrainz' release-group types (studio/EP/live/compilation) matched against your record titles by <em>text</em>, not exact MBID — approximate, not exact. Covers artists you own ${gapMinOwned}+ of and who are MusicBrainz-matched (see Insights).</p>
+        <div class="enrich-panel">
+          <div class="progress" id="discogProgress">${discogPassRunning ? `Checking artists — ${discogDone} of ${discogTotal}…` : discogStatusMsg}</div>
+          <button class="btn small${discogPassRunning ? ' running' : ''}" id="discogBtn"${hasAnyMbMatch ? '' : ' disabled'}>${discogPassRunning ? `⏹ Stop (${discogDone} of ${discogTotal})` : (discogBreakdown.length ? 'Check more discographies' : 'Check discographies')}</button>
+          <button class="btn ghost small" id="discogRefreshBtn"${hasAnyMbMatch ? '' : ' disabled'}>Refresh all</button>
+          ${!hasAnyMbMatch ? `<div class="value-note" style="margin-top:8px;">Run "Match artists to MusicBrainz" in Insights first — this needs it.</div>` : ''}
+        </div>
+        ${discogBreakdown.length ? `
+        <div class="discog-artists">
+          ${discogBreakdown.map(a => `
+            <div class="discog-artist">
+              <h4 class="gap-artist-link" data-id="${a.id}" data-name="${escapeHtml(a.name)}">${escapeHtml(a.name)}</h4>
+              ${['studio','ep','live','compilation'].filter(k=>a.buckets[k].length).map(k=>{
+                const items = a.buckets[k];
+                const ownedCount = items.filter(x=>x.owned).length;
+                const missing = items.filter(x=>!x.owned).sort((x,y)=> (y.year||'0').localeCompare(x.year||'0'));
+                const pct = items.length ? Math.round(ownedCount/items.length*100) : 0;
+                return `
+                  <div class="discog-row">
+                    <div class="discog-row-head"><span>${discogLabels[k]}</span><span class="mono">${ownedCount} / ${items.length}</span></div>
+                    <div class="bar"><i style="width:${pct}%"></i></div>
+                    ${missing.length ? `<div class="discog-missing">${missing.slice(0,8).map(m=>escapeHtml(m.title)+(m.year?` (${m.year})`:'')).join(', ')}${missing.length>8?` +${missing.length-8} more`:''}</div>` : ''}
+                  </div>`;
+              }).join('')}
+            </div>`).join('')}
+        </div>` : ''}
+      </div>`;
+
     gapsView.innerHTML = `
       <h2 style="margin:0 0 6px;">Fill the Gaps</h2>
       <p class="detail-bio" style="margin-bottom:0;">Artists you already collect on vinyl, ranked by how deep you're already in — with what's still missing from your wantlist.</p>
       ${controlsHtml}
       ${bestBuysHtml}
+      ${discogHtml}
       ${groupsHtml}`;
 
     el('gapFormatToggle').addEventListener('click', ()=>{
@@ -1649,6 +1795,8 @@
       gapMinOwned = Number(e.target.value);
       renderGapsView();
     });
+    el('discogBtn').addEventListener('click', ()=> runDiscographyPass(false));
+    el('discogRefreshBtn').addEventListener('click', ()=> runDiscographyPass(true));
     el('dealPassBtn').addEventListener('click', ()=> runDealPass(groups, false));
     el('dealRefreshBtn').addEventListener('click', ()=> runDealPass(groups, true));
     gapsView.querySelectorAll('.gap-artist-link').forEach(h=>{
@@ -1980,6 +2128,45 @@
     const bottomPool = streamedArtists.length > 8 ? streamedArtists.slice(8) : [];
     const bottomStreamed = bottomPool.slice(-8).reverse();
 
+    // Artist relationship network — filtered to edges where *both* ends are
+    // artists this collection actually credits (via the MB crosswalk),
+    // same approach as the original validation spike: a "your own artists,
+    // wired together" graph, not a firehose of every person MusicBrainz has
+    // ever linked to any of them.
+    const mbidToDiscogsId = {};
+    Object.entries(mbArtistCache).forEach(([aid, info]) => { if(info?.mbid) mbidToDiscogsId[info.mbid] = aid; });
+    const ownedCounts = ownedArtistCounts();
+    const networkNodesMap = new Map();
+    const networkEdges = [];
+    const seenPairs = new Set();
+    // Falls back to the name MusicBrainz itself reported (info.name for the
+    // artist a relations fetch ran for, edge.otherName for the far end)
+    // whenever ownedCounts has no entry — mbArtistCache/mbRelationsCache
+    // are never pruned when a record leaves the collection, so a stale
+    // entry for an artist no longer credited anywhere current would
+    // otherwise render as a nameless, "0 owned" node instead of just
+    // falling back to a name that's already sitting right there.
+    Object.entries(mbRelationsCache).forEach(([discogsId, info]) => {
+      if(!info || !info.edges) return;
+      info.edges.forEach(edge => {
+        const otherId = mbidToDiscogsId[edge.otherMbid];
+        if(!otherId || otherId === discogsId) return;
+        const pair = [discogsId, otherId].sort().join('|');
+        if(seenPairs.has(pair)) return;
+        seenPairs.add(pair);
+        networkEdges.push({ a: discogsId, b: otherId, type: edge.type });
+        if(!networkNodesMap.has(discogsId)){
+          const oc = ownedCounts.get(discogsId);
+          networkNodesMap.set(discogsId, { id: discogsId, name: oc?.name || info.name || '', owned: oc?.count || 0, country: mbArtistCache[discogsId]?.country || null });
+        }
+        if(!networkNodesMap.has(otherId)){
+          const oc2 = ownedCounts.get(otherId);
+          networkNodesMap.set(otherId, { id: otherId, name: oc2?.name || edge.otherName || '', owned: oc2?.count || 0, country: mbArtistCache[otherId]?.country || null });
+        }
+      });
+    });
+    const networkNodes = [...networkNodesMap.values()];
+
     return {
       total: collection.length,
       artistCount: artistMap.size,
@@ -1996,7 +2183,8 @@
       artistMapAll: artistMap, labelMapAll: labelMap, yearCounts,
       mbArtistTotal, mbArtistMatched, originCountryMap, originMatchedRecords,
       lbEligible, lbChecked, lbHasData, quadStyleOptions, quadPoints, quadMedianRarity, quadMedianListens,
-      topStreamed, bottomStreamed
+      topStreamed, bottomStreamed,
+      networkNodes, networkEdges
     };
   }
 
@@ -2220,6 +2408,23 @@
         </div>` : ''}
       </div>`;
 
+    const netHtml = `
+      <div class="insight-section">
+        <h3>Hvem kjenner hvem</h3>
+        <div class="enrich-panel">
+          <div class="txt">Real MusicBrainz relationships (member of, founder, collaboration…) among your ${REL_TOP_N} most-owned matched artists. Nodes sized by how much you own; only shown when both ends are artists in your own collection. ${s.mbArtistMatched ? '' : 'Run "Match artists to MusicBrainz" above first — this needs it.'}</div>
+          <div class="progress" id="relProgress">${relPassRunning ? `Checking artists — ${relDone} of ${relTotal}…` : relStatusMsg}</div>
+          <button class="btn small${relPassRunning ? ' running' : ''}" id="relBtn"${s.mbArtistMatched ? '' : ' disabled'}>${relPassRunning ? `⏹ Stop (${relDone} of ${relTotal})` : (s.networkNodes.length ? 'Rebuild network' : 'Build artist network')}</button>
+          <button class="btn ghost small" id="relRefreshBtn"${s.mbArtistMatched ? '' : ' disabled'}>Refresh all</button>
+        </div>
+        ${s.networkNodes.length ? `
+        <p class="value-note" style="margin:12px 0 10px;">${s.networkNodes.length} artists, ${s.networkEdges.length} connections. Hover a dot for who it is.</p>
+        <div class="network-box" id="networkBox">
+          <canvas id="networkCanvas"></canvas>
+          <div id="networkTooltip" class="network-tooltip" style="display:none;"></div>
+        </div>` : ''}
+      </div>`;
+
     const chartsHtml = `
       <div class="insight-section">
         <h3>The shape of your crate</h3>
@@ -2336,6 +2541,7 @@
       ${enrichHtml}
       ${mbHtml}
       ${lbHtml}
+      ${netHtml}
       ${chartsHtml}
       ${valueSection}
       ${enrichedSection}
@@ -2348,6 +2554,8 @@
     el('mbRefreshBtn').addEventListener('click', ()=> runMbPass(true));
     el('lbBtn').addEventListener('click', ()=> runLbPass(false));
     el('lbRefreshBtn').addEventListener('click', ()=> runLbPass(true));
+    el('relBtn').addEventListener('click', ()=> runRelationsPass(false));
+    el('relRefreshBtn').addEventListener('click', ()=> runRelationsPass(true));
     const quadStyleSel = el('quadStyleSelect');
     if(quadStyleSel) quadStyleSel.addEventListener('change', (e)=>{ quadStyle = e.target.value; renderInsightsView(); });
     const quadSearchInp = el('quadSearchInput');
@@ -2385,6 +2593,159 @@
       renderInsightsView();
     }));
     drawInsightCharts(s);
+    drawNetworkGraph(s);
+  }
+
+  // Force-directed layout for the "Hvem kjenner hvem" network — the exact
+  // parameters (kMul 0.15, centering 0.12, damping 0.7, 380 iterations)
+  // were tuned and validated in an offline spike against the same kind of
+  // data: default repulsion-heavy defaults left ~97% of nodes pinned to
+  // the canvas edge, these settled with 0 pinned and 0 NaN. Cached in
+  // memory and only recomputed when networkLayoutPositions is explicitly
+  // invalidated (a relations pass completing, or a cache clear) — not on
+  // every render, or the graph would visibly jump around as Insights
+  // re-renders for unrelated reasons.
+  let networkLayoutPositions = null;
+  function computeNetworkLayout(nodes, edges){
+    const W = 700, H = 520;
+    const pos = {};
+    nodes.forEach((n, i) => {
+      const angle = (i / nodes.length) * Math.PI * 2;
+      const rad = Math.min(W,H) * 0.32 * (0.6 + 0.4*Math.random());
+      pos[n.id] = { x: W/2 + Math.cos(angle)*rad, y: H/2 + Math.sin(angle)*rad, vx:0, vy:0, fx:0, fy:0 };
+    });
+    const k = Math.sqrt((W*H) / Math.max(1,nodes.length)) * 0.15;
+    for(let it=0; it<380; it++){
+      nodes.forEach(n => { const p=pos[n.id]; p.fx=0; p.fy=0; });
+      for(let i=0;i<nodes.length;i++){
+        for(let j=i+1;j<nodes.length;j++){
+          const a=pos[nodes[i].id], b=pos[nodes[j].id];
+          const dx=a.x-b.x, dy=a.y-b.y;
+          const dist=Math.sqrt(dx*dx+dy*dy)||0.01;
+          const force=(k*k)/dist;
+          const fx=(dx/dist)*force, fy=(dy/dist)*force;
+          a.fx+=fx; a.fy+=fy; b.fx-=fx; b.fy-=fy;
+        }
+      }
+      edges.forEach(e => {
+        const a=pos[e.a], b=pos[e.b]; if(!a||!b) return;
+        const dx=a.x-b.x, dy=a.y-b.y;
+        const dist=Math.sqrt(dx*dx+dy*dy)||0.01;
+        const force=(dist*dist)/k*0.5;
+        const fx=(dx/dist)*force, fy=(dy/dist)*force;
+        a.fx-=fx; a.fy-=fy; b.fx+=fx; b.fy+=fy;
+      });
+      nodes.forEach(n => {
+        const p = pos[n.id];
+        p.fx += (W/2-p.x)*0.12; p.fy += (H/2-p.y)*0.12;
+        p.vx = (p.vx+p.fx*0.02)*0.7; p.vy = (p.vy+p.fy*0.02)*0.7;
+        p.x += p.vx; p.y += p.vy;
+        p.x = Math.max(16, Math.min(W-16, p.x));
+        p.y = Math.max(16, Math.min(H-16, p.y));
+      });
+    }
+    return { pos, W, H };
+  }
+
+  function drawNetworkGraph(s){
+    const box = el('networkBox');
+    const canvas = el('networkCanvas');
+    const tooltip = el('networkTooltip');
+    if(!box || !canvas) return;
+    const nodes = s.networkNodes, edges = s.networkEdges;
+    if(!nodes.length) return;
+    const ctx = canvas.getContext('2d');
+
+    if(!networkLayoutPositions) networkLayoutPositions = computeNetworkLayout(nodes, edges);
+    const { pos, W, H } = networkLayoutPositions;
+    // The node set can grow between when a layout was cached and this draw
+    // call — a relations pass re-renders Insights every 10 artists without
+    // forcing a full relayout each time (that only happens once, when the
+    // whole pass finishes) — so anything missing gets a reasonable
+    // fallback position instead of crashing the draw loop.
+    nodes.forEach(n => {
+      if(!pos[n.id]) pos[n.id] = { x: W/2 + (Math.random()-0.5)*40, y: H/2 + (Math.random()-0.5)*40 };
+    });
+
+    const neighbors = {};
+    nodes.forEach(n => neighbors[n.id] = []);
+    edges.forEach(e => {
+      if(neighbors[e.a]) neighbors[e.a].push(e.b);
+      if(neighbors[e.b]) neighbors[e.b].push(e.a);
+    });
+
+    function radiusOf(n){ return 2.6 + Math.sqrt(n.owned) * 1.15; }
+    let hoverId = null;
+
+    function draw(){
+      const rect = box.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, rect.width*dpr);
+      canvas.height = Math.max(1, rect.height*dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      ctx.clearRect(0,0,rect.width,rect.height);
+      const sx = rect.width/W, sy = rect.height/H;
+      const style = getComputedStyle(document.documentElement);
+      const lineSoft = style.getPropertyValue('--line-soft').trim() || 'rgba(124,113,90,0.3)';
+      const mustard = style.getPropertyValue('--mustard').trim() || '#d8a51d';
+      const moss = style.getPropertyValue('--moss').trim() || '#49603f';
+      const activeNeighbors = hoverId ? neighbors[hoverId] || [] : null;
+
+      edges.forEach(e => {
+        const a = pos[e.a], b = pos[e.b];
+        if(!a||!b) return;
+        const isActive = hoverId && (e.a===hoverId || e.b===hoverId);
+        ctx.strokeStyle = isActive ? moss : lineSoft;
+        ctx.lineWidth = isActive ? 1.6 : 1;
+        ctx.globalAlpha = hoverId ? (isActive?0.9:0.15) : 0.55;
+        ctx.beginPath();
+        ctx.moveTo(a.x*sx, a.y*sy);
+        ctx.lineTo(b.x*sx, b.y*sy);
+        ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+
+      nodes.forEach(n => {
+        const p = pos[n.id];
+        const isHover = n.id === hoverId;
+        const isNeighbor = activeNeighbors && activeNeighbors.indexOf(n.id) !== -1;
+        const dim = hoverId && !isHover && !isNeighbor;
+        ctx.globalAlpha = dim ? 0.25 : 1;
+        ctx.fillStyle = isHover ? moss : mustard;
+        ctx.beginPath();
+        ctx.arc(p.x*sx, p.y*sy, radiusOf(n)*Math.min(sx,sy), 0, Math.PI*2);
+        ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+    }
+
+    box.onmousemove = (e) => {
+      const rect = box.getBoundingClientRect();
+      const sx = rect.width/W, sy = rect.height/H;
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      let best = null, bestD = 14;
+      nodes.forEach(n => {
+        const p = pos[n.id];
+        const d = Math.hypot(p.x*sx-mx, p.y*sy-my);
+        if(d < bestD){ bestD = d; best = n; }
+      });
+      const newHover = best ? best.id : null;
+      if(newHover !== hoverId){ hoverId = newHover; draw(); }
+      if(best){
+        const deg = (neighbors[best.id]||[]).length;
+        tooltip.style.display = 'block';
+        const flipX = mx > rect.width*0.62;
+        tooltip.style.left = (mx + (flipX?-12:12)) + 'px';
+        tooltip.style.top = Math.max(4, my-10) + 'px';
+        tooltip.style.transform = flipX ? 'translate(-100%,0)' : 'translate(0,0)';
+        tooltip.innerHTML = `<b>${flagEmoji(best.country)} ${escapeHtml(best.name)}</b><br>${best.owned} owned · ${deg} connection${deg===1?'':'s'}`;
+      } else {
+        tooltip.style.display = 'none';
+      }
+    };
+    box.onmouseleave = () => { hoverId = null; tooltip.style.display='none'; draw(); };
+
+    draw();
   }
 
   function drawInsightCharts(s){
@@ -2894,6 +3255,142 @@
     updateSetupToggleLabel();
   }
 
+  // Every owned (non-Various) artist id -> {count, name}, in one pass —
+  // shared groundwork for both the relationship-network and discography
+  // passes below, which each need "how many do I own" to decide scope.
+  // Keyed by String(id), not the raw number — mbArtistCache/mbRelationsCache/
+  // mbDiscographyCache are plain objects (bracket access coerces either way,
+  // so it never mattered there), but this is a Map, and Object.entries() on
+  // those caches always hands back string keys. Map.get() uses strict
+  // equality with no coercion, so a numeric key here would silently miss
+  // every lookup from code that walked in via Object.entries() instead of a
+  // raw r.artists array — exactly how the network/discography code below
+  // reaches it.
+  function ownedArtistCounts(){
+    const info = new Map();
+    collection.forEach(r => r.artists.forEach(a => {
+      if(!a.id || isVariousArtist(a)) return;
+      const key = String(a.id);
+      if(!info.has(key)) info.set(key, { count:0, name: stripSuffix(a.name) });
+      info.get(key).count++;
+    }));
+    return info;
+  }
+
+  // ---------- MusicBrainz relations (artist network) ----------
+  // Bounded to the top N most-owned MB-matched artists, not every matched
+  // artist — validated in the original research spike: value concentrates
+  // in the most-owned artists, and full coverage would take 25+ minutes at
+  // MusicBrainz' 1/sec limit (this endpoint isn't batchable like the url
+  // lookup) for little extra gain.
+  const REL_TOP_N = 180;
+  function topOwnedMbArtists(n){
+    return [...ownedArtistCounts().entries()]
+      .filter(([id]) => mbArtistCache[id]?.mbid)
+      .sort((a,b) => b[1].count - a[1].count)
+      .slice(0, n)
+      .map(([id, v]) => ({ id, mbid: mbArtistCache[id].mbid, name: v.name, count: v.count }));
+  }
+
+  // A render exception here (e.g. a bug in the hand-rolled network-graph
+  // canvas code) would otherwise propagate out of the `await`ing loop below
+  // and permanently abort a multi-minute background pass mid-flight,
+  // leaving relPassRunning/discogPassRunning stuck true with no way to
+  // recover short of a page reload — confirmed the hard way while testing
+  // this exact feature. Data already saved to IndexedDB is unaffected
+  // either way; this only protects the pass loop itself from a display bug.
+  function safeRerender(fn){
+    try{ fn(); }
+    catch(err){ console.error('Insights/Gaps re-render failed mid-pass (pass continues):', err); }
+  }
+
+  async function runRelationsPass(force){
+    if(relPassRunning){ relPassCancelled = true; return; }
+    const targets = topOwnedMbArtists(REL_TOP_N);
+    const todo = force ? targets : targets.filter(t => mbRelationsCache[t.id] === undefined);
+    if(force){
+      const ok = await showConfirm(`This re-checks MusicBrainz relationships for your top ${targets.length} artists, even ones already checked. One request per artist, no batching possible here.`, { title:'Refresh artist network?', confirmLabel:'Refresh all' });
+      if(!ok) return;
+    }
+    relPassRunning = true; relPassCancelled = false;
+    relDone = 0; relTotal = todo.length;
+    updateRelButton();
+    let erroredMessage = null;
+    for(const t of todo){
+      if(relPassCancelled) break;
+      try{ await fetchMbArtistRelations(t.id, t.mbid, t.name); }
+      catch(err){ erroredMessage = err.message; break; }
+      relDone++;
+      updateRelButton();
+      if(relDone % 10 === 0 && currentView.type === 'insights') safeRerender(renderInsightsView);
+    }
+    relPassRunning = false;
+    networkLayoutPositions = null; // node/edge set just changed — force a fresh layout
+    if(erroredMessage) relStatusMsg = `Stopped after an error (${relDone} checked first): ${erroredMessage}`;
+    else if(relPassCancelled) relStatusMsg = 'Stopped — click again to resume.';
+    else relStatusMsg = todo.length ? `Done — checked ${relDone} artist${relDone===1?'':'s'}.` : 'Nothing new to check.';
+    updateSetupToggleLabel();
+    if(currentView.type === 'insights') safeRerender(renderInsightsView);
+  }
+  function updateRelButton(){
+    const btn = el('relBtn');
+    const p = el('relProgress');
+    if(btn){
+      btn.textContent = relPassRunning ? `⏹ Stop (${relDone} of ${relTotal})` : 'Build artist network';
+      btn.classList.toggle('running', relPassRunning);
+    }
+    if(p && relPassRunning) p.textContent = `Checking artists — ${relDone} of ${relTotal}…`;
+    updateSetupToggleLabel();
+  }
+
+  // ---------- MusicBrainz discography completeness ----------
+  // Scoped the same way Fill the Gaps already scopes everything else —
+  // artists you own at least `gapMinOwned` releases of — rather than every
+  // matched artist, for the same one-request-per-artist reason as above.
+  function mbMatchedArtistsWithMinOwned(minOwned){
+    return [...ownedArtistCounts().entries()]
+      .filter(([id, v]) => v.count >= minOwned && mbArtistCache[id]?.mbid)
+      .map(([id, v]) => ({ id, mbid: mbArtistCache[id].mbid, name: v.name, count: v.count }));
+  }
+
+  async function runDiscographyPass(force){
+    if(discogPassRunning){ discogPassCancelled = true; return; }
+    const targets = mbMatchedArtistsWithMinOwned(gapMinOwned);
+    const todo = force ? targets : targets.filter(t => mbDiscographyCache[t.id] === undefined);
+    if(force){
+      const ok = await showConfirm(`This re-checks full discographies for all ${targets.length} qualifying artists, even ones already checked.`, { title:'Refresh discographies?', confirmLabel:'Refresh all' });
+      if(!ok) return;
+    }
+    discogPassRunning = true; discogPassCancelled = false;
+    discogDone = 0; discogTotal = todo.length;
+    updateDiscogButton();
+    let erroredMessage = null;
+    for(const t of todo){
+      if(discogPassCancelled) break;
+      try{ await fetchArtistDiscography(t.id, t.mbid); }
+      catch(err){ erroredMessage = err.message; break; }
+      discogDone++;
+      updateDiscogButton();
+      if(discogDone % 5 === 0 && currentView.type === 'gaps') safeRerender(renderGapsView);
+    }
+    discogPassRunning = false;
+    if(erroredMessage) discogStatusMsg = `Stopped after an error (${discogDone} checked first): ${erroredMessage}`;
+    else if(discogPassCancelled) discogStatusMsg = 'Stopped — click again to resume.';
+    else discogStatusMsg = todo.length ? `Done — checked ${discogDone} artist${discogDone===1?'':'s'}.` : 'Nothing new to check.';
+    updateSetupToggleLabel();
+    if(currentView.type === 'gaps') safeRerender(renderGapsView);
+  }
+  function updateDiscogButton(){
+    const btn = el('discogBtn');
+    const p = el('discogProgress');
+    if(btn){
+      btn.textContent = discogPassRunning ? `⏹ Stop (${discogDone} of ${discogTotal})` : 'Check discographies';
+      btn.classList.toggle('running', discogPassRunning);
+    }
+    if(p && discogPassRunning) p.textContent = `Checking artists — ${discogDone} of ${discogTotal}…`;
+    updateSetupToggleLabel();
+  }
+
   // ---------- value pass (opt-in background pricing) ----------
   function updateValueBar(){
     const items = activeItems();
@@ -2991,6 +3488,8 @@
     if(enrichWantPassRunning) label += ` · enriching wantlist ${enrichWantDone}/${enrichWantTotal}`;
     if(mbPassRunning) label += ` · matching artists ${mbDone}/${mbTotal}`;
     if(lbPassRunning) label += ` · checking popularity ${lbDone}/${lbTotal}`;
+    if(relPassRunning) label += ` · building network ${relDone}/${relTotal}`;
+    if(discogPassRunning) label += ` · checking discographies ${discogDone}/${discogTotal}`;
     setupToggleLabel.textContent = label;
   }
   setupToggle.addEventListener('click', ()=>{
@@ -3171,13 +3670,16 @@
     await idbDelete('mycrate:enrich');
     await idbDelete('mycrate:mbArtist');
     await idbDelete('mycrate:lbPopularity');
+    await idbDelete('mycrate:mbRelations');
+    await idbDelete('mycrate:mbDiscography');
     // Clean up any leftovers from before these moved to IndexedDB.
     localStorage.removeItem('mycrate:prices');
     localStorage.removeItem('mycrate:artists');
     localStorage.removeItem('mycrate:labels');
     localStorage.removeItem('mycrate:market');
     localStorage.removeItem('mycrate:enrich');
-    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {};
+    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {};
+    networkLayoutPositions = null;
     refreshNav();
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
   });
@@ -3197,6 +3699,8 @@
       enrich: enrichCache,
       mbArtist: mbArtistCache,
       lbPopularity: lbPopularityCache,
+      mbRelations: mbRelationsCache,
+      mbDiscography: mbDiscographyCache,
       assumedCondition: assumedConditionSelect.value
     };
   }
@@ -3232,6 +3736,8 @@
     if(!(await idbSetSafe('mycrate:enrich', payload.enrich || {}))) failures.push('enrichment data (playtime/credits/country)');
     if(!(await idbSetSafe('mycrate:mbArtist', payload.mbArtist || {}))) failures.push('MusicBrainz artist matches');
     if(!(await idbSetSafe('mycrate:lbPopularity', payload.lbPopularity || {}))) failures.push('ListenBrainz popularity data');
+    if(!(await idbSetSafe('mycrate:mbRelations', payload.mbRelations || {}))) failures.push('artist relationship data');
+    if(!(await idbSetSafe('mycrate:mbDiscography', payload.mbDiscography || {}))) failures.push('discography data');
     if(payload.assumedCondition) saveJSON('mycrate:assumedCondition', payload.assumedCondition);
     localStorage.setItem('mycrate:lastUser', payload.username);
     return { failures, crateCount, wantCount };
