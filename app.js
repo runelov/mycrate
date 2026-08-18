@@ -23,6 +23,7 @@
   let lbPopularityCache = {};      // discogs artist id -> {listens, listeners, fetchedAt} | null (checked, no ListenBrainz data)
   let mbRelationsCache = {};       // discogs artist id -> {mbid, name, edges:[{type,otherMbid,otherName}], fetchedAt} | null
   let mbDiscographyCache = {};     // discogs artist id -> {releaseGroups:[{mbid,title,type,secondaryTypes,firstReleaseDate}], fetchedAt} | null
+  let lbSimilarCache = {};         // discogs artist id -> {mbid, name, similar:[{mbid,name,score}], fetchedAt} | null
   let valuePassRunning = false;
   let valuePassCancelled = false;
   let valuePassForce = false;
@@ -46,6 +47,11 @@
   let discogDone = 0;
   let discogTotal = 0;
   let discogStatusMsg = '';
+  let lbSimilarPassRunning = false;
+  let lbSimilarPassCancelled = false;
+  let lbSimilarDone = 0;
+  let lbSimilarTotal = 0;
+  let lbSimilarStatusMsg = '';
   // "Hylle vs. ører" chart's own small filter state — deliberately not the
   // shared `filters`/`searchTerm` used by Browse, since the filter sidebar
   // and search box are hidden while viewing Insights (see
@@ -189,6 +195,7 @@
     lbPopularityCache = (await idbGet('mycrate:lbPopularity')) || {};
     mbRelationsCache = (await idbGet('mycrate:mbRelations')) || {};
     mbDiscographyCache = (await idbGet('mycrate:mbDiscography')) || {};
+    lbSimilarCache = (await idbGet('mycrate:lbSimilar')) || {};
     const savedCondition = loadJSON('mycrate:assumedCondition');
     if(savedCondition) assumedConditionSelect.value = savedCondition;
     displayCurrencySelect.value = displayCurrency;
@@ -210,6 +217,7 @@
   async function saveLbPopularityCache(){ await idbSet('mycrate:lbPopularity', lbPopularityCache); }
   async function saveMbRelationsCache(){ await idbSet('mycrate:mbRelations', mbRelationsCache); }
   async function saveMbDiscographyCache(){ await idbSet('mycrate:mbDiscography', mbDiscographyCache); }
+  async function saveLbSimilarCache(){ await idbSet('mycrate:lbSimilar', lbSimilarCache); }
 
   function fmtDate(iso){
     const d = new Date(iso);
@@ -676,6 +684,17 @@
   // it still gets its own conservative pacer rather than assuming it's fine
   // to hammer.
   const LB_API = "https://api.listenbrainz.org/1";
+  // A separate host from the main ListenBrainz API above — "labs" is
+  // MetaBrainz' experimental-datasets service, content-based (keyed by
+  // artist MBID, not tied to any listening history, which this app has
+  // none of for the user anyway). Verified directly: CORS-open
+  // (access-control-allow-origin: *), no documented rate limit, and
+  // batchable via repeated artist_mbids= params the same way MusicBrainz'
+  // url lookup is — up to 100 similar artists per seed, real coverage even
+  // for genuinely obscure artists in a spot-check against this project's
+  // own validation data.
+  const LB_LABS_API = "https://labs.api.listenbrainz.org";
+  const LB_SIMILAR_ALGORITHM = "session_based_days_7500_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30";
   const lbPace = { gapMs: 300, maxGapMs: 10000, lastRequestAt: 0 };
 
   async function lbFetch(url, body){
@@ -729,6 +748,40 @@
     });
     await saveLbPopularityCache();
     return byMbid;
+  }
+
+  // Batches several artists into one GET, each contributing its own
+  // repeated artist_mbids= param (confirmed the only shape the labs API
+  // accepts — comma-joining a single param 400s). The response is one flat
+  // array for the whole batch; reference_mbid on each entry is what ties a
+  // result back to which seed artist asked for it.
+  async function fetchLbSimilarArtistsBatch(discogsArtistIds){
+    const withMbid = discogsArtistIds
+      .map(id => ({ id, mbid: mbArtistCache[id]?.mbid, name: ownedArtistCounts().get(id)?.name || '' }))
+      .filter(x => x.mbid);
+    if(!withMbid.length) return {};
+    const params = withMbid.map(x => `artist_mbids=${encodeURIComponent(x.mbid)}`).join('&');
+    const resp = await lbFetch(`${LB_LABS_API}/similar-artists/json?${params}&algorithm=${LB_SIMILAR_ALGORITHM}`);
+    if(!resp.ok) throw new Error(`ListenBrainz labs returned an error (${resp.status}).`);
+    const data = await resp.json();
+    // Verified directly against the real service: batching several seed
+    // artists into one request comes back with each result repeated once
+    // per seed in the batch (e.g. a 17-artist batch returned every one of
+    // Swans' recommendations 4 times over, identical mbid and score each
+    // time) — a real characteristic of this "labs" (experimental) endpoint,
+    // not a request-construction mistake here. Deduped by artist_mbid per
+    // reference artist rather than trusted as already-unique.
+    const byRef = new Map();
+    data.forEach(entry => {
+      if(!byRef.has(entry.reference_mbid)) byRef.set(entry.reference_mbid, new Map());
+      byRef.get(entry.reference_mbid).set(entry.artist_mbid, { mbid: entry.artist_mbid, name: entry.name, score: entry.score });
+    });
+    withMbid.forEach(({ id, mbid, name }) => {
+      const similar = [...(byRef.get(mbid)?.values() || [])].sort((a,b) => b.score - a.score).slice(0, 20);
+      lbSimilarCache[id] = { mbid, name, similar, fetchedAt: Date.now() };
+    });
+    await saveLbSimilarCache();
+    return byRef;
   }
 
   // ---------- data access ----------
@@ -1384,7 +1437,8 @@
     const mb = mbArtistCache[id];
     const pop = lbPopularityCache[id];
     const rel = mbRelationsCache[id];
-    if(!mb && !pop && !rel) return null;
+    const sim = lbSimilarCache[id];
+    if(!mb && !pop && !rel && !sim) return null;
     let rank = null, totalRanked = null;
     if(pop && typeof pop.listens === 'number'){
       const ranked = collectionArtistIds()
@@ -1399,10 +1453,16 @@
     // runs for the top REL_TOP_N owned artists — most artist pages simply
     // won't have this yet, same as any other opt-in-pass data.
     const related = (rel && rel.edges.length) ? rel.edges.slice(0, 10) : null;
+    // Same "not already owned" filter as the Fill the Gaps discovery list —
+    // no point recommending someone whose records are already in the crate.
+    const ownedMbids = new Set(Object.values(mbArtistCache).map(v => v?.mbid).filter(Boolean));
+    const similar = (sim && sim.similar.length)
+      ? sim.similar.filter(s => !ownedMbids.has(s.mbid)).slice(0, 10)
+      : null;
     return {
       country: mb?.country || null,
       listens: (pop && typeof pop.listens === 'number') ? pop.listens : null,
-      rank, totalRanked, related
+      rank, totalRanked, related, similar
     };
   }
 
@@ -1455,12 +1515,18 @@
         <span class="detail-related-label">Related:</span>
         ${mbInfo.related.map(r=>`<span class="tag" title="${escapeHtml(r.type)}">${escapeHtml(r.otherName)}</span>`).join('')}
       </div>` : '';
+    const similarHtml = (mbInfo && mbInfo.similar && mbInfo.similar.length) ? `
+      <div class="detail-related">
+        <span class="detail-related-label">You might also like:</span>
+        ${mbInfo.similar.map(s=>`<a class="tag" style="background:var(--rust); cursor:pointer; text-decoration:none;" href="https://www.discogs.com/search/?q=${encodeURIComponent(s.name)}&type=artist" target="_blank" rel="noopener">${escapeHtml(s.name)}</a>`).join('')}
+      </div>` : '';
     detailView.innerHTML = `
       <span class="back-link" id="backLink">← Back to crate</span>
       <div class="detail-header">
         <h2>${escapeHtml(name)}</h2>
         ${mbLine}
         ${relatedHtml}
+        ${similarHtml}
         <div class="detail-bio" id="detailBio"><p class="detail-loading">Reading the sleeve notes…</p></div>
       </div>
       <div class="detail-section">
@@ -1598,6 +1664,31 @@
     });
     results.sort((a,b) => a.name.localeCompare(b.name));
     return results;
+  }
+
+  // Aggregates ListenBrainz's per-seed-artist recommendations into one
+  // deduplicated list, filtered to artists you don't already own anything
+  // by (matched via MBID, not name — avoids near-duplicate name spelling
+  // mismatches). Ranked by how many of your deep-dive artists independently
+  // recommended them first (breadth — a name three different artists all
+  // point to says more than one high score), then by summed score.
+  function computeDiscoveryList(){
+    const ownedMbids = new Set(Object.values(mbArtistCache).map(v => v?.mbid).filter(Boolean));
+    const bySimilar = new Map();
+    Object.values(lbSimilarCache).forEach(info => {
+      if(!info || !info.similar) return;
+      const seedName = info.name || '?';
+      info.similar.forEach(sim => {
+        if(ownedMbids.has(sim.mbid)) return;
+        if(!bySimilar.has(sim.mbid)) bySimilar.set(sim.mbid, { name: sim.name, score:0, fromNames: new Set() });
+        const entry = bySimilar.get(sim.mbid);
+        entry.score += sim.score;
+        entry.fromNames.add(seedName);
+      });
+    });
+    return [...bySimilar.values()]
+      .sort((a,b) => b.fromNames.size - a.fromNames.size || b.score - a.score)
+      .slice(0, 24);
   }
 
   function computeGaps(){
@@ -1772,12 +1863,37 @@
         </div>` : ''}
       </div>`;
 
+    // Content-based ListenBrainz recommendations, not tied to any listening
+    // history (mycrate has none) — the one section on this page pointing
+    // entirely outside your existing collection and wantlist.
+    const discoveryList = computeDiscoveryList();
+    const discoveryHtml = `
+      <div class="discog-section">
+        <h3>Discover new artists</h3>
+        <p class="detail-bio" style="margin:0 0 14px;">ListenBrainz' content-based recommendations from the artists you're deepest into (same ${gapMinOwned}+ threshold as above), filtered to artists you don't already own anything by.</p>
+        <div class="enrich-panel">
+          <div class="progress" id="lbSimilarProgress">${lbSimilarPassRunning ? `Checking artists — batch reaching ${lbSimilarDone} of ${lbSimilarTotal}…` : lbSimilarStatusMsg}</div>
+          <button class="btn small${lbSimilarPassRunning ? ' running' : ''}" id="lbSimilarBtn"${hasAnyMbMatch ? '' : ' disabled'}>${lbSimilarPassRunning ? `⏹ Stop (${lbSimilarDone} of ${lbSimilarTotal})` : (discoveryList.length ? 'Find more' : 'Find similar artists')}</button>
+          <button class="btn ghost small" id="lbSimilarRefreshBtn"${hasAnyMbMatch ? '' : ' disabled'}>Refresh all</button>
+          ${!hasAnyMbMatch ? `<div class="value-note" style="margin-top:8px;">Run "Match artists to MusicBrainz" in Insights first — this needs it.</div>` : ''}
+        </div>
+        ${discoveryList.length ? `
+        <div class="discovery-grid">
+          ${discoveryList.map(d => `
+            <a class="discovery-item" href="https://www.discogs.com/search/?q=${encodeURIComponent(d.name)}&type=artist" target="_blank" rel="noopener">
+              <div class="discovery-name">${escapeHtml(d.name)}</div>
+              <div class="discovery-from">similar to ${[...d.fromNames].slice(0,3).map(n=>escapeHtml(n)).join(', ')}${d.fromNames.size>3?` +${d.fromNames.size-3} more`:''}</div>
+            </a>`).join('')}
+        </div>` : ''}
+      </div>`;
+
     gapsView.innerHTML = `
       <h2 style="margin:0 0 6px;">Fill the Gaps</h2>
       <p class="detail-bio" style="margin-bottom:0;">Artists you already collect on vinyl, ranked by how deep you're already in — with what's still missing from your wantlist.</p>
       ${controlsHtml}
       ${bestBuysHtml}
       ${discogHtml}
+      ${discoveryHtml}
       ${groupsHtml}`;
 
     el('gapFormatToggle').addEventListener('click', ()=>{
@@ -1797,6 +1913,8 @@
     });
     el('discogBtn').addEventListener('click', ()=> runDiscographyPass(false));
     el('discogRefreshBtn').addEventListener('click', ()=> runDiscographyPass(true));
+    el('lbSimilarBtn').addEventListener('click', ()=> runLbSimilarPass(false));
+    el('lbSimilarRefreshBtn').addEventListener('click', ()=> runLbSimilarPass(true));
     el('dealPassBtn').addEventListener('click', ()=> runDealPass(groups, false));
     el('dealRefreshBtn').addEventListener('click', ()=> runDealPass(groups, true));
     gapsView.querySelectorAll('.gap-artist-link').forEach(h=>{
@@ -3391,6 +3509,52 @@
     updateSetupToggleLabel();
   }
 
+  // ---------- ListenBrainz similar artists (discovery) ----------
+  // Same relevance scoping as the discography pass — artists you own
+  // gapMinOwned+ of — but batchable unlike the two passes above (this
+  // endpoint takes multiple artist_mbids per call, same as the phase 1/2
+  // url lookups), so it moves through its targets in groups of 25 rather
+  // than one request per artist.
+  const LB_SIMILAR_BATCH = 25;
+  async function runLbSimilarPass(force){
+    if(lbSimilarPassRunning){ lbSimilarPassCancelled = true; return; }
+    const targets = mbMatchedArtistsWithMinOwned(gapMinOwned);
+    const todo = force ? targets : targets.filter(t => lbSimilarCache[t.id] === undefined);
+    if(force){
+      const ok = await showConfirm(`This re-checks ListenBrainz recommendations for all ${targets.length} qualifying artists, even ones already checked.`, { title:'Refresh discovery list?', confirmLabel:'Refresh all' });
+      if(!ok) return;
+    }
+    lbSimilarPassRunning = true; lbSimilarPassCancelled = false;
+    lbSimilarDone = 0; lbSimilarTotal = todo.length;
+    updateLbSimilarButton();
+    let erroredMessage = null;
+    for(let i = 0; i < todo.length; i += LB_SIMILAR_BATCH){
+      if(lbSimilarPassCancelled) break;
+      const batch = todo.slice(i, i + LB_SIMILAR_BATCH);
+      try{ await fetchLbSimilarArtistsBatch(batch.map(t => t.id)); }
+      catch(err){ erroredMessage = err.message; break; }
+      lbSimilarDone = Math.min(todo.length, i + batch.length);
+      updateLbSimilarButton();
+      if(currentView.type === 'gaps') safeRerender(renderGapsView);
+    }
+    lbSimilarPassRunning = false;
+    if(erroredMessage) lbSimilarStatusMsg = `Stopped after an error (${lbSimilarDone} checked first): ${erroredMessage}`;
+    else if(lbSimilarPassCancelled) lbSimilarStatusMsg = 'Stopped — click again to resume.';
+    else lbSimilarStatusMsg = todo.length ? `Done — checked ${lbSimilarDone} artist${lbSimilarDone===1?'':'s'}.` : 'Nothing new to check.';
+    updateSetupToggleLabel();
+    if(currentView.type === 'gaps') safeRerender(renderGapsView);
+  }
+  function updateLbSimilarButton(){
+    const btn = el('lbSimilarBtn');
+    const p = el('lbSimilarProgress');
+    if(btn){
+      btn.textContent = lbSimilarPassRunning ? `⏹ Stop (${lbSimilarDone} of ${lbSimilarTotal})` : 'Find similar artists';
+      btn.classList.toggle('running', lbSimilarPassRunning);
+    }
+    if(p && lbSimilarPassRunning) p.textContent = `Checking artists — batch reaching ${lbSimilarDone} of ${lbSimilarTotal}…`;
+    updateSetupToggleLabel();
+  }
+
   // ---------- value pass (opt-in background pricing) ----------
   function updateValueBar(){
     const items = activeItems();
@@ -3490,6 +3654,7 @@
     if(lbPassRunning) label += ` · checking popularity ${lbDone}/${lbTotal}`;
     if(relPassRunning) label += ` · building network ${relDone}/${relTotal}`;
     if(discogPassRunning) label += ` · checking discographies ${discogDone}/${discogTotal}`;
+    if(lbSimilarPassRunning) label += ` · finding similar artists ${lbSimilarDone}/${lbSimilarTotal}`;
     setupToggleLabel.textContent = label;
   }
   setupToggle.addEventListener('click', ()=>{
@@ -3672,13 +3837,14 @@
     await idbDelete('mycrate:lbPopularity');
     await idbDelete('mycrate:mbRelations');
     await idbDelete('mycrate:mbDiscography');
+    await idbDelete('mycrate:lbSimilar');
     // Clean up any leftovers from before these moved to IndexedDB.
     localStorage.removeItem('mycrate:prices');
     localStorage.removeItem('mycrate:artists');
     localStorage.removeItem('mycrate:labels');
     localStorage.removeItem('mycrate:market');
     localStorage.removeItem('mycrate:enrich');
-    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {};
+    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {}; lbSimilarCache = {};
     networkLayoutPositions = null;
     refreshNav();
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
@@ -3701,6 +3867,7 @@
       lbPopularity: lbPopularityCache,
       mbRelations: mbRelationsCache,
       mbDiscography: mbDiscographyCache,
+      lbSimilar: lbSimilarCache,
       assumedCondition: assumedConditionSelect.value
     };
   }
@@ -3738,6 +3905,7 @@
     if(!(await idbSetSafe('mycrate:lbPopularity', payload.lbPopularity || {}))) failures.push('ListenBrainz popularity data');
     if(!(await idbSetSafe('mycrate:mbRelations', payload.mbRelations || {}))) failures.push('artist relationship data');
     if(!(await idbSetSafe('mycrate:mbDiscography', payload.mbDiscography || {}))) failures.push('discography data');
+    if(!(await idbSetSafe('mycrate:lbSimilar', payload.lbSimilar || {}))) failures.push('similar-artist recommendations');
     if(payload.assumedCondition) saveJSON('mycrate:assumedCondition', payload.assumedCondition);
     localStorage.setItem('mycrate:lastUser', payload.username);
     return { failures, crateCount, wantCount };
