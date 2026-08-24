@@ -27,6 +27,9 @@
   let valuePassRunning = false;
   let valuePassCancelled = false;
   let valuePassForce = false;
+  let collectionValueEstimate = null; // {minimum, median, maximum, username, fetchedAt} — Discogs' own aggregate estimate, from /collection/value
+  let collectionValueLoading = false;
+  let collectionValueError = null;
   let mbPassRunning = false;
   let mbPassCancelled = false;
   let mbDone = 0;
@@ -93,6 +96,9 @@
   const valueProgress = el('valueProgress');
   const valueBtn = el('valueBtn');
   const valueRefreshBtn = el('valueRefreshBtn');
+  const collectionValueRow = el('collectionValueRow');
+  const collectionValueText = el('collectionValueText');
+  const collectionValueBtn = el('collectionValueBtn');
   const valueBarToggle = el('valueBarToggle');
   const viewModeToggle = el('viewModeToggle');
   const assumedConditionSelect = el('assumedConditionSelect');
@@ -196,6 +202,7 @@
     mbRelationsCache = (await idbGet('mycrate:mbRelations')) || {};
     mbDiscographyCache = (await idbGet('mycrate:mbDiscography')) || {};
     lbSimilarCache = (await idbGet('mycrate:lbSimilar')) || {};
+    collectionValueEstimate = loadJSON('mycrate:collectionValueEstimate');
     const savedCondition = loadJSON('mycrate:assumedCondition');
     if(savedCondition) assumedConditionSelect.value = savedCondition;
     displayCurrencySelect.value = displayCurrency;
@@ -534,6 +541,26 @@
     }
     priceCache[releaseId] = entry;
     await savePriceCache();
+    return entry;
+  }
+
+  // Discogs' own aggregate estimate for the whole collection, computed on their end
+  // from marketplace data — a single call, and a different methodology than summing
+  // this app's per-release price_suggestions (see sumValueOf/getItemValue above).
+  // Only meaningful for the authenticated user's own collection.
+  async function fetchCollectionValueEstimate(){
+    const username = usernameInput.value.trim();
+    if(!username) throw new Error("Enter your Discogs username above first.");
+    if(!currentToken()) throw new Error("Add a personal access token above first — Discogs only returns this for your own, authenticated collection.");
+    const resp = await discogsFetch(`${API}/users/${encodeURIComponent(username)}/collection/value`);
+    if(!resp.ok){
+      if(resp.status === 401 || resp.status === 403) throw new Error("Discogs rejected the request — this estimate is only available for your own collection, so the token must belong to this username.");
+      throw new Error("Could not load Discogs' collection value estimate.");
+    }
+    const data = await resp.json();
+    const entry = { minimum: data.minimum || null, median: data.median || null, maximum: data.maximum || null, username, fetchedAt: Date.now() };
+    collectionValueEstimate = entry;
+    saveJSON('mycrate:collectionValueEstimate', entry);
     return entry;
   }
 
@@ -3576,6 +3603,26 @@
       valueRefreshBtn.textContent = 'Refresh all';
       valueRefreshBtn.disabled = false;
     }
+    // Discogs' own /collection/value estimate — only meaningful for the owned
+    // collection (not the wantlist), and only for the currently-entered username.
+    if(activeDataset === 'crate'){
+      collectionValueRow.style.display = 'flex';
+      collectionValueBtn.disabled = collectionValueLoading;
+      const username = usernameInput.value.trim();
+      const fresh = collectionValueEstimate && collectionValueEstimate.username === username ? collectionValueEstimate : null;
+      collectionValueBtn.textContent = collectionValueLoading ? 'Checking…' : (fresh ? 'Refresh' : "Check Discogs' estimate");
+      if(collectionValueLoading){
+        collectionValueText.textContent = "Discogs' own estimate: checking…";
+      }else if(collectionValueError){
+        collectionValueText.textContent = collectionValueError;
+      }else if(fresh){
+        collectionValueText.textContent = `Discogs' own estimate — min ${fresh.minimum || '—'} · median ${fresh.median || '—'} · max ${fresh.maximum || '—'}`;
+      }else{
+        collectionValueText.textContent = "Discogs' own estimate: not checked yet";
+      }
+    }else{
+      collectionValueRow.style.display = 'none';
+    }
   }
 
   async function runValuePass(force){
@@ -3622,6 +3669,21 @@
 
   valueBtn.addEventListener('click', ()=> runValuePass(false));
   valueRefreshBtn.addEventListener('click', ()=> runValuePass(true));
+
+  async function runCollectionValueCheck(){
+    if(collectionValueLoading) return;
+    collectionValueLoading = true;
+    collectionValueError = null;
+    updateValueBar();
+    try{
+      await fetchCollectionValueEstimate();
+    }catch(err){
+      collectionValueError = err.message;
+    }
+    collectionValueLoading = false;
+    updateValueBar();
+  }
+  collectionValueBtn.addEventListener('click', runCollectionValueCheck);
   assumedConditionSelect.addEventListener('change', ()=>{
     saveJSON('mycrate:assumedCondition', assumedConditionSelect.value);
     updateValueBar();
@@ -3844,7 +3906,8 @@
     localStorage.removeItem('mycrate:labels');
     localStorage.removeItem('mycrate:market');
     localStorage.removeItem('mycrate:enrich');
-    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {}; lbSimilarCache = {};
+    localStorage.removeItem('mycrate:collectionValueEstimate');
+    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {}; lbSimilarCache = {}; collectionValueEstimate = null; collectionValueError = null;
     networkLayoutPositions = null;
     refreshNav();
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
