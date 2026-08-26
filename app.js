@@ -1017,7 +1017,7 @@
   function gridClass(){ return `grid grid-${viewMode}`; }
 
   function sleeveCard(r, isWant){
-    const art = r.cover ? `<img src="${r.cover}" alt="${escapeHtml(r.title)} cover" loading="lazy">`
+    const art = r.cover ? `<img src="${escapeHtml(r.cover)}" alt="${escapeHtml(r.title)} cover" loading="lazy">`
                          : `<div class="no-art">${escapeHtml(r.title)}</div>`;
     const iv = getItemValue(r);
     const priceBadge = iv
@@ -1164,7 +1164,7 @@
     if(!r){ r = collection.find(x=>x.id===id); if(r) sourceList = 'crate'; }
     if(!r){ r = wantlist.find(x=>x.id===id); if(r) sourceList = 'wantlist'; }
     if(!r) return;
-    const art = r.cover ? `<img src="${r.cover}" alt="">` : `<div class="no-art">${escapeHtml(r.title)}</div>`;
+    const art = r.cover ? `<img src="${escapeHtml(r.cover)}" alt="">` : `<div class="no-art">${escapeHtml(r.title)}</div>`;
     const artistLinks = r.artists.map(a=>`<span class="artist-link" data-type="artist" data-id="${a.id}" data-name="${escapeHtml(stripSuffix(a.name))}">${escapeHtml(stripSuffix(a.name))}</span>`).join(', ');
     const labelLinks = r.labels.map(l=>`<span class="label-link" data-type="label" data-id="${l.id}" data-name="${escapeHtml(stripSuffix(l.name))}">${escapeHtml(stripSuffix(l.name))}</span>`).join(', ') || '—';
     modalRoot.innerHTML = `
