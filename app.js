@@ -3301,11 +3301,23 @@
 
   // ---------- MusicBrainz relations (artist network) ----------
   // Bounded to the top N most-owned MB-matched artists, not every matched
-  // artist — validated in the original research spike: value concentrates
-  // in the most-owned artists, and full coverage would take 25+ minutes at
-  // MusicBrainz' 1/sec limit (this endpoint isn't batchable like the url
-  // lookup) for little extra gain.
-  const REL_TOP_N = 180;
+  // artist — this endpoint is one sequential MusicBrainz request per
+  // artist, no batching, so full coverage of a real collection (thousands
+  // of unique matched artists) would take tens of minutes.
+  //
+  // The original 180 (set 2026-08-18) was justified in code as "value
+  // concentrates in the most-owned artists... for little extra gain"
+  // beyond it, citing an unspecified "research spike" with no artifact
+  // left in this repo. Checked against a real ~4,200-record collection
+  // (2026-08-27): that claim doesn't hold — the top 180 (11% of 1,578
+  // unique owned artists) captured only 51.7% of owned-record mass, not
+  // the 80%+ a real concentration would imply, and the 181st-ranked artist
+  // still owned 6 records (no cliff at the cutoff). Of the artists actually
+  // checked for relations so far, 95.2% had at least one edge — no sign
+  // connectivity thins out near this boundary either, though that can't be
+  // confirmed further out without fetching past it. Raised to 450 pending
+  // a live test of that wider range on the same collection.
+  const REL_TOP_N = 450;
   function topOwnedMbArtists(n){
     return [...ownedArtistCounts().entries()]
       .filter(([id]) => mbArtistCache[id]?.mbid)
