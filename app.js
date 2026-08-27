@@ -27,6 +27,7 @@
   let valuePassRunning = false;
   let valuePassCancelled = false;
   let valuePassForce = false;
+  let valueDone = 0, valueTotal = 0; // mirrored from runValuePass()'s local counters, only for updateSetupToggleLabel()
   let collectionValueEstimate = null; // {minimum, median, maximum, username, fetchedAt} — Discogs' own aggregate estimate, from /collection/value
   let collectionValueLoading = false;
   let collectionValueError = null;
@@ -1975,28 +1976,22 @@
     }
     const items = groups.flatMap(g=>g.wanted);
     const todo = force ? items : items.filter(r => !marketCache[r.id]);
-    dealPassRunning = true; dealPassCancelled = false;
-    dealDone = 0; dealTotal = todo.length;
-    updateDealButton();
-    let erroredMessage = null;
-    for(const r of todo){
-      if(dealPassCancelled) break;
-      try{
+    await runCancellableLoop({
+      items: todo, batchSize: null,
+      fetch: async r => {
         await fetchMarketStats(r.id, force);
         if(!priceCache[r.id] || force) await fetchPriceSuggestions(r.id, force).catch(()=>{});
-      }catch(err){
-        erroredMessage = err.message;
-        break;
-      }
-      dealDone++;
-      updateDealButton();
-      if(dealDone % 8 === 0 && currentView.type === 'gaps') renderGapsView();
-    }
-    dealPassRunning = false;
-    if(erroredMessage) dealStatusMsg = `Stopped after an error (${dealDone} checked first): ${erroredMessage}`;
-    else if(dealPassCancelled) dealStatusMsg = 'Stopped — click again to resume.';
-    else dealStatusMsg = todo.length ? `Done — checked ${dealDone}.` : 'Nothing new to check — everything visible is already checked.';
-    if(currentView.type === 'gaps') renderGapsView();
+      },
+      setRunning: v => dealPassRunning = v,
+      getCancelled: () => dealPassCancelled, setCancelled: v => dealPassCancelled = v,
+      setDone: v => dealDone = v, setTotal: v => dealTotal = v,
+      setStatusMsg: v => dealStatusMsg = v,
+      updateButton: updateDealButton,
+      rerenderEvery: 8,
+      nothingMsg: 'Nothing new to check — everything visible is already checked.',
+      rerenderCheck: () => currentView.type === 'gaps',
+      rerenderFn: renderGapsView
+    });
   }
   function updateDealButton(){
     const btn = el('dealPassBtn');
@@ -3017,6 +3012,67 @@
 
   }
 
+  // ---------- background pass runner ----------
+  // Every enrichment/matching pass below (enrich, enrichWant, mb, lb, rel,
+  // discog, lbSimilar, deal) used to carry its own hand-copied version of
+  // this exact loop: running/cancelled/done/total/statusMsg state, a
+  // cancellable for-loop or batch loop, periodic re-render, and a
+  // Stopped/Done/error status message at the end. Collapsed into one
+  // function because the duplication had already drifted — the deal pass
+  // was silently missing from updateSetupToggleLabel() below simply because
+  // there was no single place enforcing "every pass shows up here".
+  //
+  // Each pass still owns its own target list / cache-check / fetch logic
+  // and its own updateXButton() render function — those genuinely differ
+  // (confirm text, token requirements, batch size, rerender cadence) and
+  // folding them in here would just move the duplication rather than
+  // remove it. This only owns the mechanical part: the loop itself.
+  async function runCancellableLoop(cfg){
+    const {
+      items, batchSize = null, fetch,
+      setRunning, getCancelled, setCancelled,
+      setDone, setTotal, setStatusMsg, updateButton,
+      unitLabel = '', nothingMsg = 'Nothing new to check.',
+      rerenderCheck, rerenderFn, rerenderEvery = 1, useSafeRerender = false,
+      afterStop
+    } = cfg;
+    setRunning(true); setCancelled(false);
+    setDone(0); setTotal(items.length);
+    updateButton();
+    const doRerender = () => { if(rerenderCheck()){ useSafeRerender ? safeRerender(rerenderFn) : rerenderFn(); } };
+    let done = 0, erroredMessage = null;
+    if(batchSize){
+      for(let i = 0; i < items.length; i += batchSize){
+        if(getCancelled()) break;
+        const batch = items.slice(i, i + batchSize);
+        try{ await fetch(batch); }
+        catch(err){ erroredMessage = err.message; break; }
+        done = Math.min(items.length, i + batch.length);
+        setDone(done);
+        updateButton();
+        if(done % rerenderEvery === 0) doRerender();
+      }
+    }else{
+      for(const item of items){
+        if(getCancelled()) break;
+        try{ await fetch(item); }
+        catch(err){ erroredMessage = err.message; break; }
+        done++;
+        setDone(done);
+        updateButton();
+        if(done % rerenderEvery === 0) doRerender();
+      }
+    }
+    setRunning(false);
+    if(afterStop) afterStop();
+    if(erroredMessage) setStatusMsg(`Stopped after an error (${done} checked first): ${erroredMessage}`);
+    else if(getCancelled()) setStatusMsg('Stopped — click again to resume.');
+    else setStatusMsg(items.length ? `Done — checked ${done}${unitLabel ? ` ${unitLabel}${done===1?'':'s'}` : ''}.` : nothingMsg);
+    updateSetupToggleLabel();
+    doRerender();
+    return !erroredMessage && !getCancelled();
+  }
+
   let enrichPassRunning = false, enrichPassCancelled = false, enrichDone = 0, enrichTotal = 0;
   let enrichStatusMsg = '';
   // Runs the actual per-item loop against whatever `items` it's handed —
@@ -3024,25 +3080,18 @@
   // with force) and the post-sync auto-enrich (just the records that sync
   // pulled in), so the caller decides scope and this just executes it.
   async function runEnrichLoop(items, force){
-    enrichPassRunning = true; enrichPassCancelled = false;
-    enrichDone = 0; enrichTotal = items.length;
-    updateEnrichButton();
-    let erroredMessage = null;
-    for(const r of items){
-      if(enrichPassCancelled) break;
-      try{ await fetchEnrichment(r.id, force); }
-      catch(err){ erroredMessage = err.message; break; }
-      enrichDone++;
-      updateEnrichButton();
-      if(enrichDone % 8 === 0 && currentView.type === 'insights') renderInsightsView();
-    }
-    enrichPassRunning = false;
-    if(erroredMessage) enrichStatusMsg = `Stopped after an error (${enrichDone} checked first): ${erroredMessage}`;
-    else if(enrichPassCancelled) enrichStatusMsg = 'Stopped — click again to resume.';
-    else enrichStatusMsg = items.length ? `Done — checked ${enrichDone}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'insights') renderInsightsView();
-    return !erroredMessage && !enrichPassCancelled;
+    return runCancellableLoop({
+      items,
+      fetch: r => fetchEnrichment(r.id, force),
+      setRunning: v => enrichPassRunning = v,
+      getCancelled: () => enrichPassCancelled, setCancelled: v => enrichPassCancelled = v,
+      setDone: v => enrichDone = v, setTotal: v => enrichTotal = v,
+      setStatusMsg: v => enrichStatusMsg = v,
+      updateButton: updateEnrichButton,
+      rerenderEvery: 8,
+      rerenderCheck: () => currentView.type === 'insights',
+      rerenderFn: renderInsightsView
+    });
   }
   async function runEnrichPass(force){
     if(enrichPassRunning){ enrichPassCancelled = true; return; }
@@ -3073,25 +3122,18 @@
   let enrichWantPassRunning = false, enrichWantPassCancelled = false, enrichWantDone = 0, enrichWantTotal = 0;
   let enrichWantStatusMsg = '';
   async function runEnrichWantLoop(items, force){
-    enrichWantPassRunning = true; enrichWantPassCancelled = false;
-    enrichWantDone = 0; enrichWantTotal = items.length;
-    updateEnrichWantButton();
-    let erroredMessage = null;
-    for(const r of items){
-      if(enrichWantPassCancelled) break;
-      try{ await fetchEnrichment(r.id, force); }
-      catch(err){ erroredMessage = err.message; break; }
-      enrichWantDone++;
-      updateEnrichWantButton();
-      if(enrichWantDone % 8 === 0 && currentView.type === 'insights') renderInsightsView();
-    }
-    enrichWantPassRunning = false;
-    if(erroredMessage) enrichWantStatusMsg = `Stopped after an error (${enrichWantDone} checked first): ${erroredMessage}`;
-    else if(enrichWantPassCancelled) enrichWantStatusMsg = 'Stopped — click again to resume.';
-    else enrichWantStatusMsg = items.length ? `Done — checked ${enrichWantDone}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'insights') renderInsightsView();
-    return !erroredMessage && !enrichWantPassCancelled;
+    return runCancellableLoop({
+      items,
+      fetch: r => fetchEnrichment(r.id, force),
+      setRunning: v => enrichWantPassRunning = v,
+      getCancelled: () => enrichWantPassCancelled, setCancelled: v => enrichWantPassCancelled = v,
+      setDone: v => enrichWantDone = v, setTotal: v => enrichWantTotal = v,
+      setStatusMsg: v => enrichWantStatusMsg = v,
+      updateButton: updateEnrichWantButton,
+      rerenderEvery: 8,
+      rerenderCheck: () => currentView.type === 'insights',
+      rerenderFn: renderInsightsView
+    });
   }
   async function runEnrichWantPass(force){
     if(enrichWantPassRunning){ enrichWantPassCancelled = true; return; }
@@ -3175,25 +3217,18 @@
       const ok = await showConfirm(`This re-checks MusicBrainz for all <b>${allIds.length}</b> artists in your collection, even ones already checked.`, { title:'Refresh all MusicBrainz matches?', confirmLabel:'Refresh all' });
       if(!ok) return;
     }
-    mbPassRunning = true; mbPassCancelled = false;
-    mbDone = 0; mbTotal = ids.length;
-    updateMbButton();
-    let erroredMessage = null;
-    for(let i = 0; i < ids.length; i += 100){
-      if(mbPassCancelled) break;
-      const batch = ids.slice(i, i + 100);
-      try{ await fetchMbArtistBatch(batch); }
-      catch(err){ erroredMessage = err.message; break; }
-      mbDone = Math.min(ids.length, i + batch.length);
-      updateMbButton();
-      if(currentView.type === 'insights') renderInsightsView();
-    }
-    mbPassRunning = false;
-    if(erroredMessage) mbStatusMsg = `Stopped after an error (${mbDone} checked first): ${erroredMessage}`;
-    else if(mbPassCancelled) mbStatusMsg = 'Stopped — click again to resume.';
-    else mbStatusMsg = ids.length ? `Done — checked ${mbDone} artist${mbDone===1?'':'s'}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'insights') renderInsightsView();
+    await runCancellableLoop({
+      items: ids, batchSize: 100,
+      fetch: batch => fetchMbArtistBatch(batch),
+      setRunning: v => mbPassRunning = v,
+      getCancelled: () => mbPassCancelled, setCancelled: v => mbPassCancelled = v,
+      setDone: v => mbDone = v, setTotal: v => mbTotal = v,
+      setStatusMsg: v => mbStatusMsg = v,
+      updateButton: updateMbButton,
+      unitLabel: 'artist',
+      rerenderCheck: () => currentView.type === 'insights',
+      rerenderFn: renderInsightsView
+    });
   }
   function updateMbButton(){
     const btn = el('mbBtn');
@@ -3218,25 +3253,18 @@
       const ok = await showConfirm(`This re-checks ListenBrainz for all <b>${matchedIds.length}</b> MusicBrainz-matched artists, even ones already checked.`, { title:'Refresh all ListenBrainz data?', confirmLabel:'Refresh all' });
       if(!ok) return;
     }
-    lbPassRunning = true; lbPassCancelled = false;
-    lbDone = 0; lbTotal = ids.length;
-    updateLbButton();
-    let erroredMessage = null;
-    for(let i = 0; i < ids.length; i += 100){
-      if(lbPassCancelled) break;
-      const batch = ids.slice(i, i + 100);
-      try{ await fetchLbPopularityBatch(batch); }
-      catch(err){ erroredMessage = err.message; break; }
-      lbDone = Math.min(ids.length, i + batch.length);
-      updateLbButton();
-      if(currentView.type === 'insights') renderInsightsView();
-    }
-    lbPassRunning = false;
-    if(erroredMessage) lbStatusMsg = `Stopped after an error (${lbDone} checked first): ${erroredMessage}`;
-    else if(lbPassCancelled) lbStatusMsg = 'Stopped — click again to resume.';
-    else lbStatusMsg = ids.length ? `Done — checked ${lbDone} artist${lbDone===1?'':'s'}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'insights') renderInsightsView();
+    await runCancellableLoop({
+      items: ids, batchSize: 100,
+      fetch: batch => fetchLbPopularityBatch(batch),
+      setRunning: v => lbPassRunning = v,
+      getCancelled: () => lbPassCancelled, setCancelled: v => lbPassCancelled = v,
+      setDone: v => lbDone = v, setTotal: v => lbTotal = v,
+      setStatusMsg: v => lbStatusMsg = v,
+      updateButton: updateLbButton,
+      unitLabel: 'artist',
+      rerenderCheck: () => currentView.type === 'insights',
+      rerenderFn: renderInsightsView
+    });
   }
   function updateLbButton(){
     const btn = el('lbBtn');
@@ -3306,25 +3334,21 @@
       const ok = await showConfirm(`This re-checks MusicBrainz relationships for your top ${targets.length} artists, even ones already checked. One request per artist, no batching possible here.`, { title:'Refresh artist network?', confirmLabel:'Refresh all' });
       if(!ok) return;
     }
-    relPassRunning = true; relPassCancelled = false;
-    relDone = 0; relTotal = todo.length;
-    updateRelButton();
-    let erroredMessage = null;
-    for(const t of todo){
-      if(relPassCancelled) break;
-      try{ await fetchMbArtistRelations(t.id, t.mbid, t.name); }
-      catch(err){ erroredMessage = err.message; break; }
-      relDone++;
-      updateRelButton();
-      if(relDone % 10 === 0 && currentView.type === 'insights') safeRerender(renderInsightsView);
-    }
-    relPassRunning = false;
-    networkLayoutPositions = null; // node/edge set just changed — force a fresh layout
-    if(erroredMessage) relStatusMsg = `Stopped after an error (${relDone} checked first): ${erroredMessage}`;
-    else if(relPassCancelled) relStatusMsg = 'Stopped — click again to resume.';
-    else relStatusMsg = todo.length ? `Done — checked ${relDone} artist${relDone===1?'':'s'}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'insights') safeRerender(renderInsightsView);
+    await runCancellableLoop({
+      items: todo, batchSize: null,
+      fetch: t => fetchMbArtistRelations(t.id, t.mbid, t.name),
+      setRunning: v => relPassRunning = v,
+      getCancelled: () => relPassCancelled, setCancelled: v => relPassCancelled = v,
+      setDone: v => relDone = v, setTotal: v => relTotal = v,
+      setStatusMsg: v => relStatusMsg = v,
+      updateButton: updateRelButton,
+      unitLabel: 'artist',
+      rerenderEvery: 10,
+      rerenderCheck: () => currentView.type === 'insights',
+      rerenderFn: renderInsightsView,
+      useSafeRerender: true,
+      afterStop: () => { networkLayoutPositions = null; } // node/edge set just changed — force a fresh layout
+    });
   }
   function updateRelButton(){
     const btn = el('relBtn');
@@ -3355,24 +3379,20 @@
       const ok = await showConfirm(`This re-checks full discographies for all ${targets.length} qualifying artists, even ones already checked.`, { title:'Refresh discographies?', confirmLabel:'Refresh all' });
       if(!ok) return;
     }
-    discogPassRunning = true; discogPassCancelled = false;
-    discogDone = 0; discogTotal = todo.length;
-    updateDiscogButton();
-    let erroredMessage = null;
-    for(const t of todo){
-      if(discogPassCancelled) break;
-      try{ await fetchArtistDiscography(t.id, t.mbid); }
-      catch(err){ erroredMessage = err.message; break; }
-      discogDone++;
-      updateDiscogButton();
-      if(discogDone % 5 === 0 && currentView.type === 'gaps') safeRerender(renderGapsView);
-    }
-    discogPassRunning = false;
-    if(erroredMessage) discogStatusMsg = `Stopped after an error (${discogDone} checked first): ${erroredMessage}`;
-    else if(discogPassCancelled) discogStatusMsg = 'Stopped — click again to resume.';
-    else discogStatusMsg = todo.length ? `Done — checked ${discogDone} artist${discogDone===1?'':'s'}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'gaps') safeRerender(renderGapsView);
+    await runCancellableLoop({
+      items: todo, batchSize: null,
+      fetch: t => fetchArtistDiscography(t.id, t.mbid),
+      setRunning: v => discogPassRunning = v,
+      getCancelled: () => discogPassCancelled, setCancelled: v => discogPassCancelled = v,
+      setDone: v => discogDone = v, setTotal: v => discogTotal = v,
+      setStatusMsg: v => discogStatusMsg = v,
+      updateButton: updateDiscogButton,
+      unitLabel: 'artist',
+      rerenderEvery: 5,
+      rerenderCheck: () => currentView.type === 'gaps',
+      rerenderFn: renderGapsView,
+      useSafeRerender: true
+    });
   }
   function updateDiscogButton(){
     const btn = el('discogBtn');
@@ -3400,25 +3420,19 @@
       const ok = await showConfirm(`This re-checks ListenBrainz recommendations for all ${targets.length} qualifying artists, even ones already checked.`, { title:'Refresh discovery list?', confirmLabel:'Refresh all' });
       if(!ok) return;
     }
-    lbSimilarPassRunning = true; lbSimilarPassCancelled = false;
-    lbSimilarDone = 0; lbSimilarTotal = todo.length;
-    updateLbSimilarButton();
-    let erroredMessage = null;
-    for(let i = 0; i < todo.length; i += LB_SIMILAR_BATCH){
-      if(lbSimilarPassCancelled) break;
-      const batch = todo.slice(i, i + LB_SIMILAR_BATCH);
-      try{ await fetchLbSimilarArtistsBatch(batch.map(t => t.id)); }
-      catch(err){ erroredMessage = err.message; break; }
-      lbSimilarDone = Math.min(todo.length, i + batch.length);
-      updateLbSimilarButton();
-      if(currentView.type === 'gaps') safeRerender(renderGapsView);
-    }
-    lbSimilarPassRunning = false;
-    if(erroredMessage) lbSimilarStatusMsg = `Stopped after an error (${lbSimilarDone} checked first): ${erroredMessage}`;
-    else if(lbSimilarPassCancelled) lbSimilarStatusMsg = 'Stopped — click again to resume.';
-    else lbSimilarStatusMsg = todo.length ? `Done — checked ${lbSimilarDone} artist${lbSimilarDone===1?'':'s'}.` : 'Nothing new to check.';
-    updateSetupToggleLabel();
-    if(currentView.type === 'gaps') safeRerender(renderGapsView);
+    await runCancellableLoop({
+      items: todo, batchSize: LB_SIMILAR_BATCH,
+      fetch: batch => fetchLbSimilarArtistsBatch(batch.map(t => t.id)),
+      setRunning: v => lbSimilarPassRunning = v,
+      getCancelled: () => lbSimilarPassCancelled, setCancelled: v => lbSimilarPassCancelled = v,
+      setDone: v => lbSimilarDone = v, setTotal: v => lbSimilarTotal = v,
+      setStatusMsg: v => lbSimilarStatusMsg = v,
+      updateButton: updateLbSimilarButton,
+      unitLabel: 'artist',
+      rerenderCheck: () => currentView.type === 'gaps',
+      rerenderFn: renderGapsView,
+      useSafeRerender: true
+    });
   }
   function updateLbSimilarButton(){
     const btn = el('lbSimilarBtn');
@@ -3490,6 +3504,7 @@
     updateValueBar();
     const items = force ? activeItems() : activeItems().filter(r => !priceCache[r.id]);
     let done = 0;
+    valueDone = 0; valueTotal = items.length; // for updateSetupToggleLabel() only — everything else here still uses the local `done`
     let erroredMessage = null;
     for(const r of items){
       if(valuePassCancelled) break;
@@ -3500,9 +3515,11 @@
         break;
       }
       done++;
+      valueDone = done;
       if(done % 5 === 0 || done === items.length){
         valueProgress.textContent = `${force ? 'Refreshing' : 'Pricing'} ${done} of ${items.length}…`;
         updateValueBar();
+        updateSetupToggleLabel();
         render();
       }
     }
@@ -3513,6 +3530,7 @@
       valueProgress.textContent = valuePassCancelled ? 'Stopped — click again to resume.' : (items.length ? 'Done.' : 'Nothing new to price.');
     }
     updateValueBar();
+    updateSetupToggleLabel();
     render();
   }
 
@@ -3555,17 +3573,28 @@
     setupToggle.classList.toggle('collapsed', collapsed);
     if(persist) localStorage.setItem('mycrate:setupCollapsed', collapsed ? '1' : '0');
   }
+  // Registry every background pass appends itself to, so the header's
+  // collapsed "Setup & Sync" label always reflects whatever's running
+  // regardless of which tab you're on. Previously this was a manually
+  // maintained if-chain and had already drifted — the deal pass ("Check
+  // for deals") and the value pass ("Estimate value") were both missing,
+  // simply because adding a new pass didn't force you to touch this list.
+  const BACKGROUND_PASSES = [
+    { label: 'enriching crate', running: () => enrichPassRunning, done: () => enrichDone, total: () => enrichTotal },
+    { label: 'enriching wantlist', running: () => enrichWantPassRunning, done: () => enrichWantDone, total: () => enrichWantTotal },
+    { label: 'matching artists', running: () => mbPassRunning, done: () => mbDone, total: () => mbTotal },
+    { label: 'checking popularity', running: () => lbPassRunning, done: () => lbDone, total: () => lbTotal },
+    { label: 'building network', running: () => relPassRunning, done: () => relDone, total: () => relTotal },
+    { label: 'checking discographies', running: () => discogPassRunning, done: () => discogDone, total: () => discogTotal },
+    { label: 'finding similar artists', running: () => lbSimilarPassRunning, done: () => lbSimilarDone, total: () => lbSimilarTotal },
+    { label: 'checking for deals', running: () => dealPassRunning, done: () => dealDone, total: () => dealTotal },
+    { label: 'pricing records', running: () => valuePassRunning, done: () => valueDone, total: () => valueTotal }
+  ];
   function updateSetupToggleLabel(){
     let label = collection.length
       ? `Setup & Sync · ${collection.length} record${collection.length===1?'':'s'}`
       : 'Setup & Sync';
-    if(enrichPassRunning) label += ` · enriching crate ${enrichDone}/${enrichTotal}`;
-    if(enrichWantPassRunning) label += ` · enriching wantlist ${enrichWantDone}/${enrichWantTotal}`;
-    if(mbPassRunning) label += ` · matching artists ${mbDone}/${mbTotal}`;
-    if(lbPassRunning) label += ` · checking popularity ${lbDone}/${lbTotal}`;
-    if(relPassRunning) label += ` · building network ${relDone}/${relTotal}`;
-    if(discogPassRunning) label += ` · checking discographies ${discogDone}/${discogTotal}`;
-    if(lbSimilarPassRunning) label += ` · finding similar artists ${lbSimilarDone}/${lbSimilarTotal}`;
+    BACKGROUND_PASSES.forEach(p => { if(p.running()) label += ` · ${p.label} ${p.done()}/${p.total()}`; });
     setupToggleLabel.textContent = label;
   }
   setupToggle.addEventListener('click', ()=>{
