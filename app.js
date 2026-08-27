@@ -2428,14 +2428,6 @@
           <button class="btn small${mbPassRunning ? ' running' : ''}" id="mbBtn">${mbPassRunning ? `⏹ Stop (${mbDone} of ${mbTotal})` : (s.mbArtistMatched ? 'Match more artists' : 'Match artists to MusicBrainz')}</button>
           <button class="btn ghost small" id="mbRefreshBtn">Refresh all</button>
         </div>
-        ${s.mbArtistMatched ? `
-        <div class="chart-grid" style="margin-top:14px;">
-          <div class="chart-box">
-            <h4>Artist origin</h4>
-            <p class="value-note" style="margin:-4px 0 12px;">${s.mbArtistMatched} of ${s.mbArtistTotal} artists matched to MusicBrainz (${Math.round(s.mbArtistMatched/s.mbArtistTotal*100)}%) · ${s.originMatchedRecords} of ${s.total} records have a known artist country.</p>
-            <div class="chart-tall-wrap" id="chartOriginWrap"><canvas id="chartOrigin"></canvas></div>
-          </div>
-        </div>` : ''}
         <div class="enrich-panel" style="margin-top:14px;">
           <div class="txt">Check each matched artist's ListenBrainz play count — powers the popularity ranking on artist pages and the "Best buys" signal on the Gaps tab. ${s.mbArtistMatched ? '' : 'Run "Match artists to MusicBrainz" above first — this needs it.'}</div>
           <div class="progress" id="lbProgress">${lbPassRunning ? `Checking artists — batch reaching ${lbDone} of ${lbTotal}…` : lbStatusMsg}</div>
@@ -2470,6 +2462,12 @@
           <div class="chart-box"><h4>Top styles</h4><div class="chart-tall-wrap" id="chartStylesWrap"><canvas id="chartStyles"></canvas></div></div>
           <div class="chart-box"><h4>By decade</h4><div class="chart-tall-wrap" id="chartDecadesWrap"><canvas id="chartDecades"></canvas></div></div>
           <div class="chart-box"><h4>Top labels</h4><div class="chart-tall-wrap" id="chartLabelsWrap"><canvas id="chartLabels"></canvas></div></div>
+          ${s.mbArtistMatched && Object.keys(s.originCountryMap).length ? `
+          <div class="chart-box">
+            <h4>Artist origin</h4>
+            <p class="value-note" style="margin:-4px 0 12px;">${s.mbArtistMatched} of ${s.mbArtistTotal} artists matched to MusicBrainz (${Math.round(s.mbArtistMatched/s.mbArtistTotal*100)}%) · ${s.originMatchedRecords} of ${s.total} records have a known artist country.</p>
+            <div class="chart-tall-wrap" id="chartOriginWrap"><canvas id="chartOrigin"></canvas></div>
+          </div>` : ''}
           <div class="chart-box wide">
             <h4 style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
               <span>Collecting over time</span>
@@ -2577,11 +2575,11 @@
       <div class="stat-cards">${statCardsHtml}</div>
       ${enrichHtml}
       ${mbHtml}
-      ${netHtml}
       ${chartsHtml}
       ${valueSection}
       ${enrichedSection}
       ${wantRaritySection}
+      ${netHtml}
     `;
 
     el('enrichBtn').addEventListener('click', ()=> runEnrichPass(false));
@@ -2772,20 +2770,67 @@
       ctx.globalAlpha = 1;
 
       // Permanent labels for the well-connected core, drawn last so they
-      // sit on top of every dot/edge.
+      // sit on top of every dot/edge. Dense clusters put several labeled
+      // nodes within a few pixels of each other, so placing every label at
+      // its natural anchor (right next to the dot) produced overlapping,
+      // unreadable text — a small pairwise-separation pass nudges
+      // colliding label boxes apart, leashed to a short radius from home
+      // so nothing drifts near an unrelated node; a faint leader line
+      // marks any label that actually had to move (design pass, 2026-08-27).
       ctx.font = '9.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
       ctx.textBaseline = 'middle';
+      const labelBoxes = [];
       nodes.forEach(n => {
         if(!labeledIds.has(n.id) || n.id === hoverId) return; // hover already shows the full tooltip
         const p = pos[n.id];
-        const isNeighbor = activeNeighbors && activeNeighbors.indexOf(n.id) !== -1;
-        const dim = hoverId && !isNeighbor;
-        ctx.globalAlpha = dim ? 0.3 : 0.9;
         const r = radiusOf(n)*Math.min(sx,sy);
         const flip = p.x*sx > rect.width*0.72;
-        ctx.textAlign = flip ? 'right' : 'left';
+        const w = ctx.measureText(n.name).width, h = 11;
+        const homeX = p.x*sx + (flip ? -(r+4) - w : (r+4));
+        const homeY = p.y*sy - h/2;
+        labelBoxes.push({ id:n.id, nodeX:p.x*sx, nodeY:p.y*sy, x:homeX, y:homeY, w, h, homeX, homeY });
+      });
+      const LEASH = 26;
+      for(let iter=0; iter<200; iter++){
+        for(let i=0;i<labelBoxes.length;i++){
+          for(let j=i+1;j<labelBoxes.length;j++){
+            const a = labelBoxes[i], b = labelBoxes[j];
+            const pad = 2;
+            const ox = Math.min(a.x+a.w+pad, b.x+b.w+pad) - Math.max(a.x-pad, b.x-pad);
+            const oy = Math.min(a.y+a.h+pad, b.y+b.h+pad) - Math.max(a.y-pad, b.y-pad);
+            if(ox > 0 && oy > 0){
+              if(ox < oy){
+                const dir = (a.x < b.x) ? -1 : 1;
+                a.x += dir*ox/2*0.5; b.x -= dir*ox/2*0.5;
+              }else{
+                const dir = (a.y < b.y) ? -1 : 1;
+                a.y += dir*oy/2*0.5; b.y -= dir*oy/2*0.5;
+              }
+            }
+          }
+        }
+        labelBoxes.forEach(b => {
+          const dx = b.x-b.homeX, dy = b.y-b.homeY, d = Math.hypot(dx,dy);
+          if(d > LEASH){ b.x = b.homeX + dx/d*LEASH; b.y = b.homeY + dy/d*LEASH; }
+        });
+      }
+      labelBoxes.forEach(b => {
+        const isNeighbor = activeNeighbors && activeNeighbors.indexOf(b.id) !== -1;
+        const dim = hoverId && !isNeighbor;
+        ctx.globalAlpha = dim ? 0.3 : 0.9;
+        if(Math.hypot(b.x-b.homeX, b.y-b.homeY) > 3){
+          ctx.strokeStyle = paperDim; ctx.lineWidth = 0.75;
+          const priorAlpha = ctx.globalAlpha;
+          ctx.globalAlpha = priorAlpha * 0.4;
+          ctx.beginPath();
+          ctx.moveTo(b.nodeX, b.nodeY);
+          ctx.lineTo(b.x < b.homeX ? b.x+b.w : b.x, b.y + b.h/2);
+          ctx.stroke();
+          ctx.globalAlpha = priorAlpha;
+        }
+        ctx.textAlign = 'left';
         ctx.fillStyle = paperDim;
-        ctx.fillText(n.name, p.x*sx + (flip ? -(r+4) : (r+4)), p.y*sy);
+        ctx.fillText(nodes.find(nn=>nn.id===b.id).name, b.x, b.y + b.h/2);
       });
       ctx.globalAlpha = 1;
     }
