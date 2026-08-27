@@ -55,13 +55,6 @@
   let lbSimilarDone = 0;
   let lbSimilarTotal = 0;
   let lbSimilarStatusMsg = '';
-  // "Hylle vs. ører" chart's own small filter state — deliberately not the
-  // shared `filters`/`searchTerm` used by Browse, since the filter sidebar
-  // and search box are hidden while viewing Insights (see
-  // showInsightsView()) and so can't be reached from here anyway.
-  let quadStyle = '';
-  let quadSearch = '';
-  let quadMinValue = 0;
 
   const el = id => document.getElementById(id);
   const usernameInput = el('username');
@@ -845,8 +838,9 @@
   // Primary (non-Various) artist's total ListenBrainz plays for a record,
   // or null if that artist isn't MB/LB-matched yet. Used for sorting and
   // grouping — it's an artist-level number shared by every record from the
-  // same artist, same as everywhere else this data is used (see the
-  // comment by quadPoints in computeInsights() for why).
+  // same artist, same as everywhere else this data is used (ListenBrainz
+  // has no reliable per-release data — see the comment in computeInsights()
+  // by lbEligibleIds for why).
   function getRecordPopularity(r){
     const pa = r.artists.find(a => a.id && !isVariousArtist(a));
     const pop = pa && lbPopularityCache[pa.id];
@@ -2206,72 +2200,15 @@
     });
 
     // ListenBrainz popularity — only asked about artists the MusicBrainz
-    // pass above already matched to an MBID. The "Hylle vs. ører" scatter
-    // respects quadStyle/quadSearch/quadMinValue, the chart's own small
-    // local filter state (see the comment by their declaration for why
-    // they aren't the shared Browse filters).
+    // pass above already matched to an MBID. Populated from the "Where the
+    // artists are from" panel below; feeds artistPopularityInfo() (artist
+    // detail popularity ranking) and computeBestBuys() (Gaps tab's "Best
+    // buys" listens signal) — not just Insights, so this stays computed
+    // here even though Insights no longer charts it directly.
     const lbEligibleIds = mbArtistIds.filter(id => mbArtistCache[id]?.mbid);
     const lbEligible = lbEligibleIds.length;
     const lbChecked = lbEligibleIds.filter(id => lbPopularityCache[id] !== undefined).length;
     const lbHasData = lbEligibleIds.filter(id => lbPopularityCache[id]).length;
-
-    const quadStyleOptions = Object.entries(styleMap).sort((a,b)=>b[1]-a[1]).slice(0,30).map(e=>e[0]);
-
-    // "listens" here is the primary artist's total ListenBrainz plays across
-    // their whole catalog (ListenBrainz's own /popularity/artist endpoint —
-    // there's no per-release equivalent with usable coverage; the project's
-    // validation found release-level MusicBrainz matching at only 43% vs.
-    // 94.5%/92.6% at the artist level). Every record by the same artist
-    // therefore shares the same y-value here by design, not a bug — only
-    // "rarity" (x) varies per record. The chart draws a small deterministic
-    // jitter on top of this for legibility; see drawInsightCharts().
-    const quadPoints = [];
-    if(lbHasData){
-      const searchLower = quadSearch.trim().toLowerCase();
-      collection.forEach(r => {
-        const e = enrichCache[r.id];
-        if(!e || typeof e.communityHave !== 'number' || typeof e.communityWant !== 'number' || e.communityWant <= 0) return;
-        const pa = r.artists.find(a => a.id && !isVariousArtist(a));
-        const pop = pa && lbPopularityCache[pa.id];
-        if(!pop || !pop.listens) return; // 0 listens can't sit on a log scale
-        if(quadStyle && !r.styles.includes(quadStyle)) return;
-        if(searchLower){
-          const hay = `${r.artistDisplay} ${r.labels.map(l=>l.name).join(' ')}`.toLowerCase();
-          if(!hay.includes(searchLower)) return;
-        }
-        if(quadMinValue){
-          const iv = getItemValue(r);
-          if(!iv || iv.amount < quadMinValue) return;
-        }
-        quadPoints.push({
-          title: `${r.artistDisplay} – ${r.title}`,
-          artistName: stripSuffix(pa.name),
-          recordId: r.id,
-          rarity: e.communityWant / (e.communityHave + 1),
-          listens: pop.listens
-        });
-      });
-    }
-    let quadMedianRarity = null, quadMedianListens = null;
-    if(quadPoints.length){
-      const rs = quadPoints.map(p=>p.rarity).sort((a,b)=>a-b);
-      const ls = quadPoints.map(p=>p.listens).sort((a,b)=>a-b);
-      quadMedianRarity = rs[Math.floor(rs.length/2)];
-      quadMedianListens = ls[Math.floor(ls.length/2)];
-    }
-
-    // Most/least streamed artists — whole collection, not affected by the
-    // chart's local filters above, same convention as the other Insights
-    // leaderboards (topValuable etc. also ignore active state elsewhere).
-    const streamedArtists = [];
-    artistMap.forEach((info, id) => {
-      const pop = lbPopularityCache[id];
-      if(pop) streamedArtists.push({ name: info.name, listens: pop.listens, listeners: pop.listeners });
-    });
-    streamedArtists.sort((a,b)=> b.listens - a.listens);
-    const topStreamed = streamedArtists.slice(0, 8);
-    const bottomPool = streamedArtists.length > 8 ? streamedArtists.slice(8) : [];
-    const bottomStreamed = bottomPool.slice(-8).reverse();
 
     // Artist relationship network — filtered to edges where *both* ends are
     // artists this collection actually credits (via the MB crosswalk),
@@ -2327,8 +2264,7 @@
       enrichedWantCount, topWantRarityGems,
       artistMapAll: artistMap, labelMapAll: labelMap, yearCounts,
       mbArtistTotal, mbArtistMatched, originCountryMap, originMatchedRecords,
-      lbEligible, lbChecked, lbHasData, quadStyleOptions, quadPoints, quadMedianRarity, quadMedianListens,
-      topStreamed, bottomStreamed,
+      lbEligible, lbChecked, lbHasData,
       networkNodes, networkEdges
     };
   }
@@ -2505,52 +2441,13 @@
             <div class="chart-tall-wrap" id="chartOriginWrap"><canvas id="chartOrigin"></canvas></div>
           </div>
         </div>` : ''}
-      </div>`;
-
-    const lbValueTiers = [0, 25, 50, 100, 250];
-    const lbHtml = `
-      <div class="insight-section">
-        <h3>Hylle vs. ører</h3>
-        <div class="enrich-panel">
-          <div class="txt">Discogs' have/want ratio measures vinyl scarcity. ListenBrainz measures actual listening — a different economy entirely. ${s.mbArtistMatched ? '' : 'Run "Match artists to MusicBrainz" above first — this needs it.'}</div>
+        <div class="enrich-panel" style="margin-top:14px;">
+          <div class="txt">Check each matched artist's ListenBrainz play count — powers the popularity ranking on artist pages and the "Best buys" signal on the Gaps tab. ${s.mbArtistMatched ? '' : 'Run "Match artists to MusicBrainz" above first — this needs it.'}</div>
           <div class="progress" id="lbProgress">${lbPassRunning ? `Checking artists — batch reaching ${lbDone} of ${lbTotal}…` : lbStatusMsg}</div>
           <button class="btn small${lbPassRunning ? ' running' : ''}" id="lbBtn"${s.mbArtistMatched ? '' : ' disabled'}>${lbPassRunning ? `⏹ Stop (${lbDone} of ${lbTotal})` : (s.lbHasData ? 'Check more popularity' : 'Check ListenBrainz popularity')}</button>
           <button class="btn ghost small" id="lbRefreshBtn"${s.mbArtistMatched ? '' : ' disabled'}>Refresh all</button>
         </div>
-        ${s.lbHasData ? `
-        <p class="value-note" style="margin:12px 0 10px;">${s.lbHasData} of ${s.lbEligible} MusicBrainz-matched artists have ListenBrainz data.</p>
-        <div class="quad-filters">
-          <select id="quadStyleSelect">
-            <option value="">All styles</option>
-            ${s.quadStyleOptions.map(st=>`<option value="${escapeHtml(st)}"${quadStyle===st?' selected':''}>${escapeHtml(st)}</option>`).join('')}
-          </select>
-          <input type="text" id="quadSearchInput" placeholder="Search artist or label…" value="${escapeHtml(quadSearch)}">
-          <select id="quadValueSelect">
-            ${lbValueTiers.map(v=>`<option value="${v}"${quadMinValue===v?' selected':''}>${v===0?'All values':`Over $${v}`}</option>`).join('')}
-          </select>
-        </div>
-        <div class="chart-grid" style="margin-top:6px;">
-          <div class="chart-box wide">
-            <h4>Rarity vs. streams</h4>
-            <p class="value-note" style="margin:-4px 0 12px;">${s.quadPoints.length} record${s.quadPoints.length===1?'':'s'} shown. Streams are the <em>artist's</em> total ListenBrainz plays, not per record — ListenBrainz has no reliable per-release data, so albums by the same artist share one value and cluster on the same row (nudged apart slightly so they stay visible; hover a dot for the real number).</p>
-            ${s.quadPoints.length ? `<canvas id="chartRarityStreams" style="height:420px;"></canvas>` : `<p class="value-note">Nothing matches that combination of filters.</p>`}
-          </div>
-          ${s.topStreamed.length ? `
-          <div class="chart-box wide">
-            <h4>Most and least streamed artists</h4>
-            <div class="leaderboard-split">
-              <table class="leaderboard">
-                <thead><tr><th>Most streamed</th><th style="text-align:right;">Plays</th></tr></thead>
-                <tbody>${s.topStreamed.map(a=>`<tr><td>${escapeHtml(a.name)}</td><td class="num">${a.listens.toLocaleString()}</td></tr>`).join('')}</tbody>
-              </table>
-              ${s.bottomStreamed.length ? `
-              <table class="leaderboard">
-                <thead><tr><th>Least streamed</th><th style="text-align:right;">Plays</th></tr></thead>
-                <tbody>${s.bottomStreamed.map(a=>`<tr><td>${escapeHtml(a.name)}</td><td class="num">${a.listens.toLocaleString()}</td></tr>`).join('')}</tbody>
-              </table>` : ''}
-            </div>
-          </div>` : ''}
-        </div>` : ''}
+        ${s.lbHasData ? `<p class="value-note" style="margin:12px 0 0;">${s.lbHasData} of ${s.lbEligible} MusicBrainz-matched artists have ListenBrainz data.</p>` : ''}
       </div>`;
 
     const netHtml = `
@@ -2563,7 +2460,7 @@
           <button class="btn ghost small" id="relRefreshBtn"${s.mbArtistMatched ? '' : ' disabled'}>Refresh all</button>
         </div>
         ${s.networkNodes.length ? `
-        <p class="value-note" style="margin:12px 0 10px;">${s.networkNodes.length} artists, ${s.networkEdges.length} connections. Hover a dot for who it is.</p>
+        <p class="value-note" style="margin:12px 0 10px;">${s.networkNodes.length} artists, ${s.networkEdges.length} connections. Dot size = records you own; the most-connected names are labeled — hover any dot for the rest.</p>
         <div class="network-box" id="networkBox">
           <canvas id="networkCanvas"></canvas>
           <div id="networkTooltip" class="network-tooltip" style="display:none;"></div>
@@ -2685,7 +2582,6 @@
       <div class="stat-cards">${statCardsHtml}</div>
       ${enrichHtml}
       ${mbHtml}
-      ${lbHtml}
       ${netHtml}
       ${chartsHtml}
       ${valueSection}
@@ -2701,12 +2597,6 @@
     el('lbRefreshBtn').addEventListener('click', ()=> runLbPass(true));
     el('relBtn').addEventListener('click', ()=> runRelationsPass(false));
     el('relRefreshBtn').addEventListener('click', ()=> runRelationsPass(true));
-    const quadStyleSel = el('quadStyleSelect');
-    if(quadStyleSel) quadStyleSel.addEventListener('change', (e)=>{ quadStyle = e.target.value; renderInsightsView(); });
-    const quadSearchInp = el('quadSearchInput');
-    if(quadSearchInp) quadSearchInp.addEventListener('change', (e)=>{ quadSearch = e.target.value; renderInsightsView(); });
-    const quadValueSel = el('quadValueSelect');
-    if(quadValueSel) quadValueSel.addEventListener('change', (e)=>{ quadMinValue = Number(e.target.value)||0; renderInsightsView(); });
     if(el('enrichWantBtn')){
       el('enrichWantBtn').addEventListener('click', ()=> runEnrichWantPass(false));
       el('enrichWantRefreshBtn').addEventListener('click', ()=> runEnrichWantPass(true));
@@ -2822,6 +2712,23 @@
     function radiusOf(n){ return 2.6 + Math.sqrt(n.owned) * 1.15; }
     let hoverId = null;
 
+    // Static labels — the chart used to be unlabeled dots you could only
+    // identify one at a time by hovering, which read as decoration rather
+    // than data (design-critique pass, 2026-08-27). Labeling everyone would
+    // just swap "unreadable" for "cluttered" in a box this small, so only
+    // the most-connected nodes (the ones actually carrying the "who knows
+    // whom" story) get a permanent name; low-degree leaves stay reachable
+    // via hover only, same as before.
+    const LABEL_MAX = 14, LABEL_MIN_DEGREE = 2;
+    const labeledIds = new Set(
+      [...nodes]
+        .map(n => ({ n, deg: (neighbors[n.id]||[]).length }))
+        .filter(x => x.deg >= LABEL_MIN_DEGREE)
+        .sort((a,b) => b.deg - a.deg || b.n.owned - a.n.owned)
+        .slice(0, LABEL_MAX)
+        .map(x => x.n.id)
+    );
+
     function draw(){
       const rect = box.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
@@ -2834,6 +2741,7 @@
       const lineSoft = style.getPropertyValue('--line-soft').trim() || 'rgba(124,113,90,0.3)';
       const mustard = style.getPropertyValue('--mustard').trim() || '#d8a51d';
       const moss = style.getPropertyValue('--moss').trim() || '#49603f';
+      const paperDim = style.getPropertyValue('--paper-dim').trim() || '#ded2b4';
       const activeNeighbors = hoverId ? neighbors[hoverId] || [] : null;
 
       edges.forEach(e => {
@@ -2855,11 +2763,34 @@
         const isHover = n.id === hoverId;
         const isNeighbor = activeNeighbors && activeNeighbors.indexOf(n.id) !== -1;
         const dim = hoverId && !isHover && !isNeighbor;
-        ctx.globalAlpha = dim ? 0.25 : 1;
+        // Degree-1 leaves (the small isolated pairs/triples that used to
+        // just float with no visual cue they mattered less) sit at lower
+        // opacity by default, so the eye lands on the connected core first.
+        const isLeaf = (neighbors[n.id]||[]).length <= 1;
+        const baseAlpha = isLeaf && !hoverId ? 0.45 : 1;
+        ctx.globalAlpha = dim ? 0.25 : baseAlpha;
         ctx.fillStyle = isHover ? moss : mustard;
         ctx.beginPath();
         ctx.arc(p.x*sx, p.y*sy, radiusOf(n)*Math.min(sx,sy), 0, Math.PI*2);
         ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+
+      // Permanent labels for the well-connected core, drawn last so they
+      // sit on top of every dot/edge.
+      ctx.font = '9.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+      ctx.textBaseline = 'middle';
+      nodes.forEach(n => {
+        if(!labeledIds.has(n.id) || n.id === hoverId) return; // hover already shows the full tooltip
+        const p = pos[n.id];
+        const isNeighbor = activeNeighbors && activeNeighbors.indexOf(n.id) !== -1;
+        const dim = hoverId && !isNeighbor;
+        ctx.globalAlpha = dim ? 0.3 : 0.9;
+        const r = radiusOf(n)*Math.min(sx,sy);
+        const flip = p.x*sx > rect.width*0.72;
+        ctx.textAlign = flip ? 'right' : 'left';
+        ctx.fillStyle = paperDim;
+        ctx.fillText(n.name, p.x*sx + (flip ? -(r+4) : (r+4)), p.y*sy);
       });
       ctx.globalAlpha = 1;
     }
@@ -3084,88 +3015,6 @@
       });
     }
 
-    // Rarity vs. streams — Discogs vinyl-scarcity on one axis, ListenBrainz
-    // artist-level plays on the other, both log-scaled since both span many
-    // orders of magnitude. Chart.js' built-in scatter type does the actual
-    // plotting; the only custom part is a small plugin drawing crosshair
-    // lines through the median of the currently-filtered points and
-    // labeling the four resulting quadrants, registered per-chart rather
-    // than globally since it only makes sense on this one canvas.
-    //
-    // "listens" is per artist, not per release (see the comment in
-    // computeInsights() by quadPoints), so every record by a prolific
-    // artist plots at exactly the same y — without help that reads as a
-    // bug rather than a deliberate data-coverage tradeoff. jitterY() nudges
-    // the *drawn* position by a small, deterministic (same record -> same
-    // offset every render) amount so overlapping records stay visible as a
-    // cluster instead of one suspicious dot; the tooltip always reports the
-    // real, un-jittered number.
-    function jitterY(recordId, value){
-      const seed = Math.sin(recordId * 12.9898) * 43758.5453;
-      const frac = seed - Math.floor(seed); // deterministic pseudo-random in [0,1)
-      return value * (1 + (frac - 0.5) * 0.3); // ±15%
-    }
-    if(s.quadPoints.length){
-      const medRarity = s.quadMedianRarity, medListens = s.quadMedianListens;
-      const quadrantBgPlugin = {
-        id: 'quadrantBg',
-        beforeDatasetsDraw(chart){
-          const { ctx, chartArea, scales } = chart;
-          if(!chartArea) return;
-          const xPix = scales.x.getPixelForValue(medRarity);
-          const yPix = scales.y.getPixelForValue(medListens);
-          ctx.save();
-          ctx.strokeStyle = 'rgba(236,227,206,0.15)';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(xPix, chartArea.top); ctx.lineTo(xPix, chartArea.bottom);
-          ctx.moveTo(chartArea.left, yPix); ctx.lineTo(chartArea.right, yPix);
-          ctx.stroke();
-          ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = 'rgba(222,210,180,0.5)';
-          ctx.textBaseline = 'top'; ctx.textAlign = 'left';
-          ctx.fillText('MAINSTREAM HIT', chartArea.left + 8, chartArea.top + 8);
-          ctx.textAlign = 'right';
-          ctx.fillText('VINYL-RARE CLASSIC', chartArea.right - 8, chartArea.top + 8);
-          ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-          ctx.fillText('FORGOTTEN', chartArea.left + 8, chartArea.bottom - 8);
-          ctx.textAlign = 'right';
-          ctx.fillText('DEEP CUT', chartArea.right - 8, chartArea.bottom - 8);
-          ctx.restore();
-        }
-      };
-      makeChart('chartRarityStreams', {
-        type: 'scatter',
-        data: {
-          datasets: [{
-            data: s.quadPoints.map(p => ({
-              x: p.rarity, y: jitterY(p.recordId, p.listens),
-              title: p.title, artistName: p.artistName, realListens: p.listens
-            })),
-            backgroundColor: 'rgba(216,165,29,0.55)',
-            pointRadius: 4,
-            pointHoverRadius: 6
-          }]
-        },
-        options: {
-          maintainAspectRatio: false,
-          scales: {
-            x: { type: 'logarithmic', title: { display:true, text:'Discogs rarity (want ÷ have) →', color:'#7c715a' } },
-            y: { type: 'logarithmic', title: { display:true, text:"Artist's total ListenBrainz plays →", color:'#7c715a' } }
-          },
-          plugins: {
-            legend: { display:false },
-            tooltip: {
-              callbacks: {
-                title: (items) => items[0]?.raw?.title || '',
-                label: (ctx) => `rarity ${ctx.raw.x.toFixed(2)} · ${ctx.raw.artistName}: ${Math.round(ctx.raw.realListens).toLocaleString()} plays total`
-              }
-            }
-          }
-        },
-        plugins: [quadrantBgPlugin]
-      });
-    }
   }
 
   let enrichPassRunning = false, enrichPassCancelled = false, enrichDone = 0, enrichTotal = 0;
