@@ -3303,20 +3303,31 @@
   // Bounded to the top N most-owned MB-matched artists, not every matched
   // artist — this endpoint is one sequential MusicBrainz request per
   // artist, no batching, so full coverage of a real collection (thousands
-  // of unique matched artists) would take tens of minutes.
+  // of unique matched artists) would take tens of minutes, longer under
+  // MusicBrainz' own server-side backoff (observed degrading to ~20s/
+  // request under this project's sustained load — see mbPace above).
   //
   // The original 180 (set 2026-08-18) was justified in code as "value
   // concentrates in the most-owned artists... for little extra gain"
   // beyond it, citing an unspecified "research spike" with no artifact
-  // left in this repo. Checked against a real ~4,200-record collection
-  // (2026-08-27): that claim doesn't hold — the top 180 (11% of 1,578
-  // unique owned artists) captured only 51.7% of owned-record mass, not
-  // the 80%+ a real concentration would imply, and the 181st-ranked artist
-  // still owned 6 records (no cliff at the cutoff). Of the artists actually
-  // checked for relations so far, 95.2% had at least one edge — no sign
-  // connectivity thins out near this boundary either, though that can't be
-  // confirmed further out without fetching past it. Raised to 450 pending
-  // a live test of that wider range on the same collection.
+  // left in this repo. Live-tested against a real ~4,200-record collection
+  // (2026-08-27) instead, banding connectivity by ownership rank:
+  //
+  //   rank    artists-per-band  have->=1 edge   avg edges
+  //   1-90          90              97.8%          9.51
+  //   91-180        90              92.2%          7.27
+  //   181-270       90              90.0%          8.60
+  //   271-360       40 (partial)    97.5%          6.90
+  //
+  // No cliff anywhere in that range -- connectivity stays flat at
+  // 90-98% all the way through rank 360, well past the old 180 cutoff,
+  // and artists there still own 3+ records each (the true one-record long
+  // tail doesn't start until past ~450). The "little extra gain beyond
+  // the top artists" claim doesn't hold up for this collection. Raised to
+  // 450 on that basis -- still an arbitrary round number, not a confirmed
+  // elbow, since the fetch was stopped (cost/time) before reaching
+  // 361-450 or beyond. Revisit if a full run ever confirms where the
+  // curve actually bends.
   const REL_TOP_N = 450;
   function topOwnedMbArtists(n){
     return [...ownedArtistCounts().entries()]
