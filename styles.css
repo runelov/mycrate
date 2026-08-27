@@ -359,6 +359,22 @@
   .track-row .pos{ color:var(--rust); width:36px; flex-shrink:0; }
   .track-row .dur{ margin-left:auto; color:var(--line); }
   .track-loading, .track-error{ font-size:12.5px; color:var(--line); font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace; }
+  .cluster-list{
+    max-height:60vh; overflow-y:auto; padding-right:6px;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent;
+  }
+  .cluster-list::-webkit-scrollbar{ width:6px; }
+  .cluster-list::-webkit-scrollbar-track{ background:transparent; }
+  .cluster-list::-webkit-scrollbar-thumb{ background:var(--line); border-radius:var(--radius); }
+  .cluster-artist{ padding:10px 0; border-bottom:1px solid rgba(0,0,0,0.08); }
+  .cluster-artist:last-child{ border-bottom:none; }
+  .cluster-artist-head{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
+  .cluster-artist-name{ color:var(--rust); text-decoration:underline dotted; text-underline-offset:2px; cursor:pointer; font-weight:600; }
+  .cluster-artist-name:hover{ color:var(--ink); }
+  .cluster-artist-owned{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace; font-size:11px; color:var(--line); white-space:nowrap; }
+  .cluster-edge{ font-size:12.5px; color:var(--ink); margin:4px 0 0 14px; display:flex; align-items:baseline; gap:8px; }
+  .cluster-edge .cluster-artist-name{ font-weight:400; }
+  .cluster-edge-type{ font-size:10.5px; color:var(--line); text-transform:uppercase; letter-spacing:0.03em; margin-left:auto; white-space:nowrap; }
   a.discogs-link{ font-size:12px; color:var(--rust); text-decoration:underline; display:inline-block; margin-top:16px; }
   .modal-footer-row{ display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:16px; }
   .modal-footer-row .discogs-link{ margin-top:0; }

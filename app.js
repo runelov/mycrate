@@ -2447,7 +2447,7 @@
           <button class="btn ghost small" id="relRefreshBtn"${s.mbArtistMatched ? '' : ' disabled'}>Refresh all</button>
         </div>
         ${s.networkNodes.length ? `
-        <p class="value-note" style="margin:12px 0 10px;">${s.networkNodes.length} artists, ${s.networkEdges.length} connections. Dot size = records you own; the most-connected names are labeled — hover any dot for the rest.</p>
+        <p class="value-note" style="margin:12px 0 10px;">${s.networkNodes.length} artists, ${s.networkEdges.length} connections. Dot size = records you own; the most-connected names are labeled — hover any dot for the rest, or click one to see its whole cluster in detail.</p>
         <div class="network-box" id="networkBox">
           <canvas id="networkCanvas"></canvas>
           <div id="networkTooltip" class="network-tooltip" style="display:none;"></div>
@@ -2675,6 +2675,87 @@
     return { pos, W, H };
   }
 
+  // Every node in this graph already has at least one edge by construction
+  // (computeInsights() only adds a node when it's found on the far end of
+  // a relation), so a plain BFS from any clicked node reaches exactly the
+  // connected component it visually belongs to — no separate community-
+  // detection pass needed, "cluster" and "connected component" are the
+  // same thing here.
+  function findClusterFor(startId, nodes, edges){
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
+    const adj = new Map();
+    nodes.forEach(n => adj.set(n.id, []));
+    edges.forEach(e => {
+      if(adj.has(e.a)) adj.get(e.a).push(e);
+      if(adj.has(e.b)) adj.get(e.b).push(e);
+    });
+    const seen = new Set([startId]);
+    const queue = [startId];
+    while(queue.length){
+      const cur = queue.shift();
+      (adj.get(cur)||[]).forEach(e => {
+        const other = e.a === cur ? e.b : e.a;
+        if(!seen.has(other)){ seen.add(other); queue.push(other); }
+      });
+    }
+    return {
+      nodes: [...seen].map(id => nodeMap.get(id)).filter(Boolean),
+      edges: edges.filter(e => seen.has(e.a) && seen.has(e.b))
+    };
+  }
+
+  function capitalizeFirst(str){ return str ? str.charAt(0).toUpperCase() + str.slice(1) : str; }
+
+  // Richer per-cluster view: clicking a node in the network opens this
+  // instead of just the hover tooltip — one artist per row, each with its
+  // direct connections *and* what MusicBrainz calls that relationship
+  // (member of / founder / collaboration…), which the graph itself has no
+  // room to show. Reuses the record modal's shell (.modal-backdrop/.modal)
+  // for visual consistency; content is unrelated so it's a separate
+  // function rather than another branch inside openModal().
+  function openClusterModal(startId, allNodes, allEdges){
+    const cluster = findClusterFor(startId, allNodes, allEdges);
+    const byId = new Map(cluster.nodes.map(n => [n.id, n]));
+    const connectionsOf = new Map();
+    cluster.nodes.forEach(n => connectionsOf.set(n.id, []));
+    cluster.edges.forEach(e => {
+      const a = byId.get(e.a), b = byId.get(e.b);
+      if(!a || !b) return;
+      connectionsOf.get(e.a).push({ other: b, type: e.type });
+      connectionsOf.get(e.b).push({ other: a, type: e.type });
+    });
+    const sortedNodes = [...cluster.nodes].sort((a,b) => b.owned - a.owned);
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop" id="backdrop">
+        <div class="modal cluster-modal">
+          <button class="modal-close" id="modalClose">&times;</button>
+          <h2 style="margin:0 0 4px;">Artist cluster</h2>
+          <p style="margin:0 0 20px;color:var(--line);font-size:13px;">${cluster.nodes.length} artist${cluster.nodes.length===1?'':'s'}, ${cluster.edges.length} connection${cluster.edges.length===1?'':'s'} — click a name to open that artist.</p>
+          <div class="cluster-list">
+            ${sortedNodes.map(n => `
+              <div class="cluster-artist">
+                <div class="cluster-artist-head">
+                  <span class="cluster-artist-name" data-id="${n.id}" data-name="${escapeHtml(n.name)}">${flagEmoji(n.country)} ${escapeHtml(n.name)}</span>
+                  <span class="cluster-artist-owned">${n.owned} owned</span>
+                </div>
+                ${connectionsOf.get(n.id).map(c => `
+                  <div class="cluster-edge">→ <span class="cluster-artist-name" data-id="${c.other.id}" data-name="${escapeHtml(c.other.name)}">${escapeHtml(c.other.name)}</span><span class="cluster-edge-type">${escapeHtml(capitalizeFirst(c.type||'related'))}</span></div>
+                `).join('')}
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      </div>`;
+    el('backdrop').addEventListener('click', e=>{ if(e.target.id==='backdrop') closeModal(); });
+    el('modalClose').addEventListener('click', closeModal);
+    document.addEventListener('keydown', escCloseOnce);
+    modalRoot.querySelectorAll('.cluster-artist-name').forEach(node => node.addEventListener('click', ()=>{
+      closeModal();
+      openArtistView(Number(node.dataset.id), node.dataset.name);
+    }));
+  }
+
   function drawNetworkGraph(s){
     const box = el('networkBox');
     const canvas = el('networkCanvas');
@@ -2835,16 +2916,22 @@
       ctx.globalAlpha = 1;
     }
 
-    box.onmousemove = (e) => {
+    function nodeAt(mx, my){
       const rect = box.getBoundingClientRect();
       const sx = rect.width/W, sy = rect.height/H;
-      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       let best = null, bestD = 14;
       nodes.forEach(n => {
         const p = pos[n.id];
         const d = Math.hypot(p.x*sx-mx, p.y*sy-my);
         if(d < bestD){ bestD = d; best = n; }
       });
+      return best;
+    }
+
+    box.onmousemove = (e) => {
+      const rect = box.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      const best = nodeAt(mx, my);
       const newHover = best ? best.id : null;
       if(newHover !== hoverId){ hoverId = newHover; draw(); }
       if(best){
@@ -2854,12 +2941,17 @@
         tooltip.style.left = (mx + (flipX?-12:12)) + 'px';
         tooltip.style.top = Math.max(4, my-10) + 'px';
         tooltip.style.transform = flipX ? 'translate(-100%,0)' : 'translate(0,0)';
-        tooltip.innerHTML = `<b>${flagEmoji(best.country)} ${escapeHtml(best.name)}</b><br>${best.owned} owned · ${deg} connection${deg===1?'':'s'}`;
+        tooltip.innerHTML = `<b>${flagEmoji(best.country)} ${escapeHtml(best.name)}</b><br>${best.owned} owned · ${deg} connection${deg===1?'':'s'} · click to see the cluster`;
       } else {
         tooltip.style.display = 'none';
       }
     };
     box.onmouseleave = () => { hoverId = null; tooltip.style.display='none'; draw(); };
+    box.onclick = (e) => {
+      const rect = box.getBoundingClientRect();
+      const best = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
+      if(best) openClusterModal(best.id, nodes, edges);
+    };
 
     draw();
   }
