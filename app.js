@@ -3788,6 +3788,22 @@
       : 'Setup & Sync';
     BACKGROUND_PASSES.forEach(p => { if(p.running()) label += ` · ${p.label} ${p.done()}/${p.total()}`; });
     setupToggleLabel.textContent = label;
+    updateDocumentTitle();
+  }
+
+  // A background pass (e.g. "Enrich my collection") can run for minutes to
+  // hours, but its only progress UI lives in the Setup panel / Insights tab
+  // — invisible the moment you switch tabs, minimize, or just look away,
+  // which reads as "the browser is hanging" with no way to tell it's still
+  // working. The browser tab title is visible regardless of which app tab
+  // or window has focus, so mirror progress there too. DOCUMENT_TITLE is
+  // captured once, before anything here ever rewrites it.
+  const DOCUMENT_TITLE = document.title;
+  function updateDocumentTitle(){
+    const running = BACKGROUND_PASSES.filter(p => p.running());
+    document.title = running.length
+      ? `(${running.map(p => `${p.done()}/${p.total()}`).join(', ')}) ${DOCUMENT_TITLE}`
+      : DOCUMENT_TITLE;
   }
   setupToggle.addEventListener('click', ()=>{
     setSetupCollapsed(!setupPanel.classList.contains('collapsed'), true);
