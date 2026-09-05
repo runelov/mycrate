@@ -13,7 +13,7 @@
   let searchTerm = "";
   let activeDataset = 'crate';     // 'crate' | 'wantlist'
   let currentView = { type:'browse' };
-  const trackCache = new Map();    // release id -> tracklist (session only)
+  let trackDataCache = {};         // release id -> {tracklist:[{position,title,duration,duration_sec,type_}], notes, fetchedAt} — persisted (IndexedDB), see docs/arkitektur.md
   let priceCache = {};             // release id -> {low, median, high, currency, unavailable, fetchedAt}
   let artistCache = {};            // artist id -> {name, profile, fetchedAt}
   let labelCache = {};             // label id -> {name, profile, fetchedAt}
@@ -191,6 +191,7 @@
     labelCache = (await idbGet('mycrate:labels')) || {};
     marketCache = (await idbGet('mycrate:market')) || {};
     enrichCache = (await idbGet('mycrate:enrich')) || {};
+    trackDataCache = (await idbGet('mycrate:tracklists')) || {};
     mbArtistCache = (await idbGet('mycrate:mbArtist')) || {};
     lbPopularityCache = (await idbGet('mycrate:lbPopularity')) || {};
     mbRelationsCache = (await idbGet('mycrate:mbRelations')) || {};
@@ -212,6 +213,7 @@
   async function savePriceCache(){ await idbSet('mycrate:prices', priceCache); }
   async function saveMarketCache(){ await idbSet('mycrate:market', marketCache); }
   async function saveEnrichCache(){ await idbSet('mycrate:enrich', enrichCache); }
+  async function saveTrackDataCache(){ await idbSet('mycrate:tracklists', trackDataCache); }
   async function saveArtistCache(){ await idbSet('mycrate:artists', artistCache); }
   async function saveLabelCache(){ await idbSet('mycrate:labels', labelCache); }
   async function saveMbArtistCache(){ await idbSet('mycrate:mbArtist', mbArtistCache); }
@@ -447,8 +449,24 @@
     return 0;
   }
 
+  // Raw tracklist fields only (position/title/duration/type_, plus a computed
+  // duration_sec) — deliberately no derived analysis flags (e.g. "has a place
+  // name") stored alongside. Those criteria change as they're refined; the
+  // raw track title is the only form stable enough to reuse for whatever
+  // query someone thinks of next. See docs/arkitektur.md, Beslutning 4.
+  function extractTracklist(data){
+    return (data.tracklist||[]).map(t => ({
+      position: t.position || '',
+      title: t.title || '',
+      duration: t.duration || '',
+      duration_sec: parseDurationToSeconds(t.duration),
+      type_: t.type_ || 'track'
+    }));
+  }
+
   async function storeEnrichmentFromReleaseData(releaseId, data){
-    const totalDurationSec = (data.tracklist||[]).reduce((sum,t)=> sum + parseDurationToSeconds(t.duration), 0);
+    const tracklist = extractTracklist(data);
+    const totalDurationSec = tracklist.reduce((sum,t)=> sum + t.duration_sec, 0);
     const credits = (data.extraartists||[]).filter(a=>typeof a.id === 'number').map(a=>({ id:a.id, name:(a.name||'').replace(/\s\(\d+\)$/,''), role:a.role||'' }));
     const entry = {
       country: data.country || null,
@@ -460,20 +478,27 @@
     };
     enrichCache[releaseId] = entry;
     await saveEnrichCache();
+    // Every caller of this function (fetchTracklist for the modal,
+    // fetchEnrichment for the Insights enrich pass) already fetches this
+    // same /releases/{id} payload — persist the tracklist half of it too,
+    // instead of discarding it, so both the lazy per-modal-open path and the
+    // full-collection "Enrich my collection" pass durably backfill tracklist
+    // data as a side effect, with no separate bulk-fetch UI needed.
+    trackDataCache[releaseId] = { tracklist, notes: data.notes || '', fetchedAt: Date.now() };
+    await saveTrackDataCache();
     return entry;
   }
 
   async function fetchTracklist(releaseId){
-    if(trackCache.has(releaseId)) return trackCache.get(releaseId);
+    const cached = trackDataCache[releaseId];
+    if(cached) return cached;
     const resp = await discogsFetch(`${API}/releases/${releaseId}`);
     if(!resp.ok) throw new Error('Could not load the tracklist for this release.');
     const data = await resp.json();
     // Opening a record's modal already fetches this full payload for the tracklist —
     // piggyback the Insights enrichment fields off it for free, no extra request.
     await storeEnrichmentFromReleaseData(releaseId, data);
-    const result = { tracklist: data.tracklist || [], notes: data.notes || '' };
-    trackCache.set(releaseId, result);
-    return result;
+    return trackDataCache[releaseId];
   }
 
   async function fetchEnrichment(releaseId, force){
@@ -3238,7 +3263,14 @@
       if(p) p.textContent = enrichStatusMsg;
       return;
     }
-    const items = force ? collection : collection.filter(r => !enrichCache[r.id]);
+    // "Missing" means either half is missing, not just enrichCache — records
+    // enriched before tracklist storage existed have enrichCache but no
+    // trackDataCache entry, and would otherwise never get backfilled without
+    // a full, costly "Refresh all". Same request either way (one /releases/
+    // {id} call fetches both), so this costs nothing extra when both are
+    // already present, and fills the tracklist gap on an otherwise-ordinary
+    // "Enrich my collection" click. See docs/arkitektur.md, Beslutning 2.
+    const items = force ? collection : collection.filter(r => !enrichCache[r.id] || !trackDataCache[r.id]);
     if(force){
       const ok = await showConfirm(`This re-checks full details for all <b>${collection.length}</b> records, one Discogs request each.`, { title:'Refresh all enrichment data?', confirmLabel:'Refresh all' });
       if(!ok) return;
@@ -3280,7 +3312,7 @@
       if(p) p.textContent = enrichWantStatusMsg;
       return;
     }
-    const items = force ? wantlist : wantlist.filter(r => !enrichCache[r.id]);
+    const items = force ? wantlist : wantlist.filter(r => !enrichCache[r.id] || !trackDataCache[r.id]); // see Beslutning 2 comment above
     if(force){
       const ok = await showConfirm(`This re-checks full details for all <b>${wantlist.length}</b> wantlist records, one Discogs request each.`, { title:'Refresh all wantlist enrichment data?', confirmLabel:'Refresh all' });
       if(!ok) return;
@@ -3312,7 +3344,7 @@
     autoEnrichCrateQueue.push(...newItems);
     if(!currentToken() || enrichPassRunning) return;
     while(autoEnrichCrateQueue.length){
-      const items = autoEnrichCrateQueue.filter(r => !enrichCache[r.id]);
+      const items = autoEnrichCrateQueue.filter(r => !enrichCache[r.id] || !trackDataCache[r.id]);
       autoEnrichCrateQueue = [];
       if(!items.length) break;
       const ok = await runEnrichLoop(items, false);
@@ -3324,7 +3356,7 @@
     autoEnrichWantQueue.push(...newItems);
     if(!currentToken() || enrichWantPassRunning) return;
     while(autoEnrichWantQueue.length){
-      const items = autoEnrichWantQueue.filter(r => !enrichCache[r.id]);
+      const items = autoEnrichWantQueue.filter(r => !enrichCache[r.id] || !trackDataCache[r.id]);
       autoEnrichWantQueue = [];
       if(!items.length) break;
       const ok = await runEnrichWantLoop(items, false);
@@ -3933,6 +3965,7 @@
     await idbDelete('mycrate:labels');
     await idbDelete('mycrate:market');
     await idbDelete('mycrate:enrich');
+    await idbDelete('mycrate:tracklists');
     await idbDelete('mycrate:mbArtist');
     await idbDelete('mycrate:lbPopularity');
     await idbDelete('mycrate:mbRelations');
@@ -3945,12 +3978,18 @@
     localStorage.removeItem('mycrate:market');
     localStorage.removeItem('mycrate:enrich');
     localStorage.removeItem('mycrate:collectionValueEstimate');
-    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {}; lbSimilarCache = {}; collectionValueEstimate = null; collectionValueError = null;
+    collection = []; wantlist = []; priceCache = {}; artistCache = {}; labelCache = {}; marketCache = {}; enrichCache = {}; trackDataCache = {}; mbArtistCache = {}; lbPopularityCache = {}; mbRelationsCache = {}; mbDiscographyCache = {}; lbSimilarCache = {}; collectionValueEstimate = null; collectionValueError = null;
     networkLayoutPositions = null;
     refreshNav();
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
   });
 
+  // Deliberately does NOT include trackDataCache — tracklist data goes to its
+  // own file (tracklists.json, see githubPushTracklists/githubPullTracklists
+  // below) rather than into this blob. It changes at a different cadence
+  // (write-once per release, essentially never after) than everything below,
+  // which changes on every sync/price-check — see docs/arkitektur.md,
+  // Beslutning 3.
   async function buildBackupPayload(){
     const username = usernameInput.value.trim() || localStorage.getItem('mycrate:lastUser') || '';
     return {
@@ -4081,15 +4120,15 @@
     return resp.status === 204 ? null : resp.json();
   }
 
-  async function githubPush(onProgress){
+  // Shared by githubPush (mycrate-backup.json) and githubPushTracklists
+  // (tracklists.json, see docs/arkitektur.md Beslutning 3) — writes one file
+  // as its own commit. Handles the same empty-repo bootstrap (Contents API
+  // first commit) as before; unchanged behavior for the original caller.
+  async function githubPushFile(path, jsonStr, commitMessage, onProgress){
     const parsed = parseRepoInput();
     if(!parsed) throw new Error('Enter the repo as "github-username/repo-name".');
     const { owner, repo } = parsed;
-    const path = ghPath.value.trim() || 'mycrate-backup.json';
     const api = `https://api.github.com/repos/${owner}/${repo}`;
-
-    const payload = await buildBackupPayload();
-    const jsonStr = JSON.stringify(payload);
     const contentB64 = utf8ToBase64(jsonStr);
 
     onProgress && onProgress('Checking repo…');
@@ -4108,9 +4147,8 @@
       // Handled below: bootstrap the first commit and create the branch.
     }
 
-    let newCommitSha;
     if(refData){
-      onProgress && onProgress('Uploading backup blob…');
+      onProgress && onProgress('Uploading blob…');
       const blob = await githubApiFetch(`${api}/git/blobs`, {
         method:'POST',
         body: JSON.stringify({ content: contentB64, encoding:'base64' })
@@ -4123,13 +4161,12 @@
       });
       const newCommit = await githubApiFetch(`${api}/git/commits`, {
         method:'POST',
-        body: JSON.stringify({ message:`MyCrate backup — ${new Date().toISOString()}`, tree: tree.sha, parents:[refData.object.sha] })
+        body: JSON.stringify({ message: commitMessage, tree: tree.sha, parents:[refData.object.sha] })
       });
-      newCommitSha = newCommit.sha;
       onProgress && onProgress('Updating branch…');
       await githubApiFetch(`${api}/git/refs/heads/${encodeURIComponent(branch)}`, {
         method:'PATCH',
-        body: JSON.stringify({ sha: newCommitSha })
+        body: JSON.stringify({ sha: newCommit.sha })
       });
     }else{
       // Bootstrapping a genuinely empty repo: the low-level Git Data API
@@ -4137,28 +4174,53 @@
       // The simple Contents API is specifically built to create a new file
       // from nothing, so use that just for this first commit.
       onProgress && onProgress('Creating first commit (empty repo)…');
-      let created;
       try{
-        created = await githubApiFetch(`${api}/contents/${path.split('/').map(encodeURIComponent).join('/')}`, {
+        await githubApiFetch(`${api}/contents/${path.split('/').map(encodeURIComponent).join('/')}`, {
           method:'PUT',
-          body: JSON.stringify({ message:`MyCrate backup — ${new Date().toISOString()}`, content: contentB64 })
+          body: JSON.stringify({ message: commitMessage, content: contentB64 })
         });
       }catch(err){
         throw new Error(`Couldn't create the first commit (${err.message}). A quick one-time fix: on GitHub, open the repo and click "Add a README file" (or add any file) to give it one initial commit, then try Push again — after that, pushes use a different path with no size limit.`);
       }
-      newCommitSha = created.commit?.sha;
     }
+  }
+
+  async function githubPush(onProgress){
+    const path = ghPath.value.trim() || 'mycrate-backup.json';
+    const payload = await buildBackupPayload();
+    const jsonStr = JSON.stringify(payload);
+    await githubPushFile(path, jsonStr, `MyCrate backup — ${new Date().toISOString()}`, onProgress);
     return { crateCount: payload.collection?.items?.length||0, wantCount: payload.wantlist?.items?.length||0 };
   }
 
-  async function githubPull(onProgress){
+  function tracklistsPathFor(mainPath){
+    const trimmed = (mainPath || '').trim() || 'mycrate-backup.json';
+    const idx = trimmed.lastIndexOf('/');
+    return idx === -1 ? 'tracklists.json' : trimmed.slice(0, idx+1) + 'tracklists.json';
+  }
+
+  // Own file, own commit, independent of the main backup — see
+  // docs/arkitektur.md, Beslutning 3. Only called when there's actually
+  // something cached, so a collection with no backfilled tracklists yet
+  // doesn't push an empty file.
+  async function githubPushTracklists(onProgress){
+    const path = tracklistsPathFor(ghPath.value.trim());
+    const payload = { myCrateTracklists: 1, exportedAt: new Date().toISOString(), tracklists: trackDataCache };
+    await githubPushFile(path, JSON.stringify(payload), `MyCrate tracklists — ${new Date().toISOString()}`, onProgress);
+    return { trackCount: Object.keys(trackDataCache).length };
+  }
+
+  // Shared by githubPull and githubPullTracklists — fetches and JSON-parses
+  // one file, handling the same large-file Git Data API fallback and
+  // truncation sanity-check as before. Returns the parsed payload; callers
+  // validate its shape themselves (the two files have different envelopes).
+  async function githubPullFile(path, onProgress){
     const parsed = parseRepoInput();
     if(!parsed) throw new Error('Enter the repo as "github-username/repo-name".');
     const { owner, repo } = parsed;
-    const path = ghPath.value.trim() || 'mycrate-backup.json';
     const api = `https://api.github.com/repos/${owner}/${repo}`;
 
-    onProgress && onProgress('Fetching backup…');
+    onProgress && onProgress('Fetching…');
     let jsonStr, reportedSize, pathUsed;
     let needsGitDataApi = false;
     try{
@@ -4177,6 +4239,11 @@
         pathUsed = 'contents API';
       }
     }catch(err){
+      // A genuine 404 (file doesn't exist at all) is meaningful to callers —
+      // e.g. githubPullTracklists treats "no tracklists.json yet" as normal,
+      // not an error — so propagate it as-is rather than folding it into the
+      // large-file fallback below.
+      if(err.status === 404) throw err;
       if(!/too large/i.test(err.message)) throw err;
       needsGitDataApi = true;
     }
@@ -4203,8 +4270,7 @@
       ? ` GitHub reports the file as ${reportedSize} bytes; decoded to ${actualBytes} bytes via ${pathUsed}${reportedSize !== actualBytes ? ' — MISMATCH, likely truncated or corrupted in transit' : ' (matches)'}.`
       : '';
 
-    let payload;
-    try{ payload = JSON.parse(jsonStr); }
+    try{ return JSON.parse(jsonStr); }
     catch(e){
       const posMatch = e.message.match(/position (\d+)/i);
       let context = '';
@@ -4212,9 +4278,31 @@
         const pos = Number(posMatch[1]);
         context = ` Near byte ${pos}: …${jsonStr.slice(Math.max(0,pos-40), pos)}⚠${jsonStr.slice(pos, pos+40)}…`;
       }
-      throw new Error(`The file in that repo doesn't look like valid JSON (${e.message}).${sizeNote}${context}`);
+      throw new Error(`The file at "${path}" doesn't look like valid JSON (${e.message}).${sizeNote}${context}`);
     }
+  }
+
+  async function githubPull(onProgress){
+    const path = ghPath.value.trim() || 'mycrate-backup.json';
+    const payload = await githubPullFile(path, onProgress);
     if(!isValidBackupPayload(payload)) throw new Error("That file doesn't look like a valid MyCrate backup.");
+    return payload;
+  }
+
+  // Returns null (not an error) when tracklists.json simply doesn't exist
+  // yet — e.g. before the first push post-upgrade, or for a repo that never
+  // had tracklist data pushed. Any other failure (malformed JSON, network,
+  // auth) still throws.
+  async function githubPullTracklists(onProgress){
+    const path = tracklistsPathFor(ghPath.value.trim());
+    let payload;
+    try{
+      payload = await githubPullFile(path, onProgress);
+    }catch(err){
+      if(err.status === 404) return null;
+      throw err;
+    }
+    if(!payload || payload.myCrateTracklists !== 1) throw new Error(`The file at "${path}" doesn't look like a MyCrate tracklists file.`);
     return payload;
   }
 
@@ -4230,7 +4318,15 @@
     ghPushBtn.disabled = true; ghPullBtn.disabled = true;
     try{
       const { crateCount, wantCount } = await githubPush(msg => ghNote.innerHTML = msg);
-      ghNote.innerHTML = `Pushed just now — ${crateCount} crate records, ${wantCount} wantlist items.`;
+      // Separate file, separate commit (docs/arkitektur.md Beslutning 3) —
+      // only pushed when there's actually something cached locally.
+      let trackNote = '';
+      const trackCount = Object.keys(trackDataCache).length;
+      if(trackCount){
+        await githubPushTracklists(msg => ghNote.innerHTML = msg);
+        trackNote = ` Tracklists for ${trackCount} releases pushed to tracklists.json.`;
+      }
+      ghNote.innerHTML = `Pushed just now — ${crateCount} crate records, ${wantCount} wantlist items.${trackNote}`;
     }catch(err){
       ghNote.innerHTML = `<span style="color:var(--rust)">${escapeHtml(err.message)}</span>`;
     }finally{
@@ -4247,14 +4343,30 @@
       const wantCount = payload.wantlist?.items?.length || 0;
       const existingHasData = collection.length || wantlist.length;
       const msg = existingHasData
-        ? `This backup for "<b>${escapeHtml(payload.username)}</b>" contains <b>${crateCount}</b> crate records and <b>${wantCount}</b> wantlist items. It will replace what's cached in this browser now, plus pricing/deal/bio data.`
+        ? `This backup for "<b>${escapeHtml(payload.username)}</b>" contains <b>${crateCount}</b> crate records and <b>${wantCount}</b> wantlist items. It will replace what's cached in this browser now, plus pricing/deal/bio data and any pulled tracklists.`
         : `Pull the backup for "<b>${escapeHtml(payload.username)}</b>" — <b>${crateCount}</b> crate records and <b>${wantCount}</b> wantlist items?`;
       const ok = await showConfirm(msg, { title:'Replace local data?', confirmLabel:'Pull & replace' });
       if(!ok){ ghNote.innerHTML = ghNoteDefault; ghPushBtn.disabled=false; ghPullBtn.disabled=false; return; }
       const { failures } = await applyBackupPayload(payload);
+
+      // Best-effort: a repo pushed before this feature existed simply has no
+      // tracklists.json yet (githubPullTracklists returns null for that,
+      // not an error) — don't let that fail the whole pull.
+      let trackNote = '';
+      try{
+        const tracklistsPayload = await githubPullTracklists(msg => ghNote.innerHTML = msg);
+        if(tracklistsPayload){
+          trackDataCache = tracklistsPayload.tracklists || {};
+          await saveTrackDataCache();
+          trackNote = ` Tracklists for ${Object.keys(trackDataCache).length} releases pulled.`;
+        }
+      }catch(err){
+        trackNote = ` (Tracklists file couldn't be pulled: ${escapeHtml(err.message)})`;
+      }
+
       reportImportOutcome(payload.username, failures, crateCount, wantCount);
       await reinitializeFromStorage(payload.username);
-      ghNote.innerHTML = `Pulled from GitHub just now — <b>${collection.length}</b> crate records, <b>${wantlist.length}</b> wantlist items.`;
+      ghNote.innerHTML = `Pulled from GitHub just now — <b>${collection.length}</b> crate records, <b>${wantlist.length}</b> wantlist items.${trackNote}`;
     }catch(err){
       ghNote.innerHTML = `<span style="color:var(--rust)">${escapeHtml(err.message)}</span>`;
     }finally{
