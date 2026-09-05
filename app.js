@@ -502,7 +502,15 @@
   }
 
   async function fetchEnrichment(releaseId, force){
-    if(!force && enrichCache[releaseId]) return enrichCache[releaseId];
+    // Also requires trackDataCache, not just enrichCache — otherwise a
+    // record enriched before tracklist storage existed short-circuits here
+    // and never actually re-fetches, silently defeating the "missing" filter
+    // in runEnrichPass/runEnrichWantPass (which does know to include it) one
+    // layer up. Found the hard way: with only the outer filter fixed, "Enrich
+    // my collection" reported "Done" almost immediately and 0 tracklists
+    // ever got persisted, because every item hit this early return instead
+    // of actually fetching. See docs/arkitektur.md, Beslutning 2.
+    if(!force && enrichCache[releaseId] && trackDataCache[releaseId]) return enrichCache[releaseId];
     const resp = await discogsFetch(`${API}/releases/${releaseId}`);
     if(!resp.ok) throw new Error('Could not load extra detail for this release.');
     const data = await resp.json();
