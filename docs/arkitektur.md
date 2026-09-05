@@ -140,6 +140,27 @@ mønster i koden allerede gjør det meste av jobben, før den spesifiserer en ny
 UI-komponent — her sparte det både en ny knapp, nye state-variabler, og et
 nytt kritikkpass i fase 3, uten tap av funksjonalitet.
 
+**Oppfølgingsbug funnet i produksjon (2026-09-05), rettet i commit
+`736ad33`:** det utvidede «missing»-filteret i `runEnrichPass()`/
+`runEnrichWantPass()` (over) plukket riktig ut poster som manglet
+`trackDataCache` selv om de allerede hadde `enrichCache` — men selve
+`fetchEnrichment(releaseId, force)` hadde sin EGEN, uavhengige
+short-circuit (`if(!force && enrichCache[releaseId]) return
+enrichCache[releaseId];`) som ikke visste noe om `trackDataCache`. Netto
+effekt: for en samling der nesten alt allerede var enrichet fra før (som
+brukerens — `enrichCache` hadde 7426 oppføringer), returnerte
+`fetchEnrichment` umiddelbart for praktisk talt hver post uten noen gang å
+faktisk hente fra Discogs — «Enrich my collection» rapporterte «Done —
+checked 4220» nesten momentant, men **null** tracklists ble persistert
+(bekreftet direkte mot brukerens IndexedDB: 0 nøkler i
+`mycrate:tracklists` etter et fullført pass). Fikset ved at
+`fetchEnrichment` nå også krever `trackDataCache[releaseId]` for å ta
+short-circuit-veien — samme logikk som den ytre filtreringen, bare ett
+lag dypere. Lærdom: når «missing» omdefineres til å dekke to felt, må
+*alle* stedene som sjekker «er dette allerede gjort» oppdateres samtidig,
+ikke bare det ytterste filteret — en indre cache-sjekk lenger nede i
+kallkjeden kan stille overstyre en riktig ytre beslutning.
+
 ---
 
 ## Beslutning 3 — Backup-format: egen fil i `mycrate-db`
