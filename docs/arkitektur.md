@@ -200,6 +200,31 @@ betyr også at de to filene kan komme ut av sync med hverandre — se
 eventual-consistency-punktet under, som må adresseres i implementasjonen,
 ikke oppdages i drift.
 
+**Oppfølgingsbug funnet i produksjon (2026-09-05), rettet i commiten som
+innførte `githubPushFiles()` (søk git-loggen etter «Update is not a fast
+forward»):** første implementasjon pushet de to filene som to sekvensielle
+commits (`githubPushFile()` kalt to ganger etter hverandre i samme
+klikk-handler). Brukeren fikk en reell «Update is not a fast forward»-feil
+fra GitHub første gang det ble prøvd. Årsak: den andre pushens «les
+nåværende branch-tip»-kall kunne fortsatt se branch-tipen *fra før* den
+første pushen et lite øyeblikk (GitHub sin egen read-after-write-lag på
+Git Data API-et), bygget da sin commit på et parent-sha som ikke lenger var
+faktisk tip når ref-oppdateringen kom — utelukkende selvpåført, ingenting
+annet skrev til repoet samtidig. Ikke den samme eventual-consistency-risikoen
+som ble diskutert over (den handler om at de to filene kan komme ut av
+sync over *tid*, på tvers av separate pusher) — dette var en race *innad i
+samme klikk*, med millisekunders vindu.
+
+**Fiks:** slått sammen til én `githubPushFiles(files, …)`-funksjon som
+leser branch-refen ÉN gang, laster opp én blob per fil, og bygger étt
+tre/én commit/én ref-oppdatering for begge filene sammen. Ingen andre
+lesing av refen mellom de to filene → ingenting å race mot. Filene er
+fortsatt to separate JSON-blobber i repoet (resonnementet over om ulik
+endringstakt gjelder uendret) — det er kun antall git-commits per push som
+gikk fra to til én. Pull-siden (`githubPullFile()`, kalt separat for hver
+fil) er urørt: lesing racer ikke mot seg selv på samme måte som skriving
+gjør.
+
 ---
 
 ## Beslutning 4 — Datamodell: rå felter, ikke forhåndsberegnede analyse-flagg

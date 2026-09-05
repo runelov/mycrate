@@ -4008,12 +4008,12 @@
     showState(`<h2>Cache cleared</h2><p>Enter your token (if needed) and sync again to reload your crate.</p>`);
   });
 
-  // Deliberately does NOT include trackDataCache — tracklist data goes to its
-  // own file (tracklists.json, see githubPushTracklists/githubPullTracklists
-  // below) rather than into this blob. It changes at a different cadence
-  // (write-once per release, essentially never after) than everything below,
-  // which changes on every sync/price-check — see docs/arkitektur.md,
-  // Beslutning 3.
+  // Deliberately does NOT include trackDataCache — tracklist data goes to
+  // its own file (tracklists.json, built and pushed alongside this one in
+  // the same commit by githubPush() below) rather than into this blob. It's
+  // a separate file because it changes at a different cadence (write-once
+  // per release, essentially never after) than everything below, which
+  // changes on every sync/price-check — see docs/arkitektur.md, Beslutning 3.
   async function buildBackupPayload(){
     const username = usernameInput.value.trim() || localStorage.getItem('mycrate:lastUser') || '';
     return {
@@ -4144,16 +4144,22 @@
     return resp.status === 204 ? null : resp.json();
   }
 
-  // Shared by githubPush (mycrate-backup.json) and githubPushTracklists
-  // (tracklists.json, see docs/arkitektur.md Beslutning 3) — writes one file
-  // as its own commit. Handles the same empty-repo bootstrap (Contents API
-  // first commit) as before; unchanged behavior for the original caller.
-  async function githubPushFile(path, jsonStr, commitMessage, onProgress){
+  // Writes one or more files in a SINGLE commit (one blob per file, one
+  // tree, one commit, one ref update) — not one commit per file. Originally
+  // this pushed mycrate-backup.json and tracklists.json as two sequential
+  // commits; in production that raced against GitHub's own read-after-write
+  // lag on the intermediate ref read (the second push's "read current
+  // branch tip" could still see the *pre-first-push* tip for a moment),
+  // failing with "Update is not a fast forward" — entirely self-inflicted,
+  // since nothing else was writing to the repo. One commit built from one
+  // ref read removes the second read entirely, so there's nothing left to
+  // race. See docs/arkitektur.md, Beslutning 3, and its "Oppfølgingsbug"
+  // note for the incident this replaced.
+  async function githubPushFiles(files, commitMessage, onProgress){
     const parsed = parseRepoInput();
     if(!parsed) throw new Error('Enter the repo as "github-username/repo-name".');
     const { owner, repo } = parsed;
     const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const contentB64 = utf8ToBase64(jsonStr);
 
     onProgress && onProgress('Checking repo…');
     const repoInfo = await githubApiFetch(api);
@@ -4172,16 +4178,20 @@
     }
 
     if(refData){
-      onProgress && onProgress('Uploading blob…');
-      const blob = await githubApiFetch(`${api}/git/blobs`, {
-        method:'POST',
-        body: JSON.stringify({ content: contentB64, encoding:'base64' })
-      });
+      onProgress && onProgress(files.length > 1 ? `Uploading ${files.length} blobs…` : 'Uploading blob…');
+      const blobs = [];
+      for(const f of files){
+        const blob = await githubApiFetch(`${api}/git/blobs`, {
+          method:'POST',
+          body: JSON.stringify({ content: utf8ToBase64(f.jsonStr), encoding:'base64' })
+        });
+        blobs.push({ path: f.path, sha: blob.sha });
+      }
       const commit = await githubApiFetch(`${api}/git/commits/${refData.object.sha}`);
       onProgress && onProgress('Building new commit…');
       const tree = await githubApiFetch(`${api}/git/trees`, {
         method:'POST',
-        body: JSON.stringify({ base_tree: commit.tree.sha, tree:[{ path, mode:'100644', type:'blob', sha: blob.sha }] })
+        body: JSON.stringify({ base_tree: commit.tree.sha, tree: blobs.map(b => ({ path: b.path, mode:'100644', type:'blob', sha: b.sha })) })
       });
       const newCommit = await githubApiFetch(`${api}/git/commits`, {
         method:'POST',
@@ -4194,27 +4204,24 @@
       });
     }else{
       // Bootstrapping a genuinely empty repo: the low-level Git Data API
-      // (blob/tree/commit/ref) doesn't reliably work with zero prior commits.
-      // The simple Contents API is specifically built to create a new file
-      // from nothing, so use that just for this first commit.
-      onProgress && onProgress('Creating first commit (empty repo)…');
-      try{
-        await githubApiFetch(`${api}/contents/${path.split('/').map(encodeURIComponent).join('/')}`, {
-          method:'PUT',
-          body: JSON.stringify({ message: commitMessage, content: contentB64 })
-        });
-      }catch(err){
-        throw new Error(`Couldn't create the first commit (${err.message}). A quick one-time fix: on GitHub, open the repo and click "Add a README file" (or add any file) to give it one initial commit, then try Push again — after that, pushes use a different path with no size limit.`);
+      // (blob/tree/commit/ref) doesn't reliably work with zero prior commits,
+      // and the Contents API (built for exactly this) only takes one file
+      // per call — so a brand-new repo with two files to push still gets two
+      // sequential commits here, unlike the normal case above. Rare (one
+      // time, ever, per repo) and low-risk: nothing else has ever committed
+      // to this repo yet at this point, so there's no ref-race partner.
+      for(const f of files){
+        onProgress && onProgress(`Creating ${files.indexOf(f)===0 ? 'first commit' : 'next commit'} (empty repo)…`);
+        try{
+          await githubApiFetch(`${api}/contents/${f.path.split('/').map(encodeURIComponent).join('/')}`, {
+            method:'PUT',
+            body: JSON.stringify({ message: commitMessage, content: utf8ToBase64(f.jsonStr) })
+          });
+        }catch(err){
+          throw new Error(`Couldn't create the first commit (${err.message}). A quick one-time fix: on GitHub, open the repo and click "Add a README file" (or add any file) to give it one initial commit, then try Push again — after that, pushes use a different path with no size limit.`);
+        }
       }
     }
-  }
-
-  async function githubPush(onProgress){
-    const path = ghPath.value.trim() || 'mycrate-backup.json';
-    const payload = await buildBackupPayload();
-    const jsonStr = JSON.stringify(payload);
-    await githubPushFile(path, jsonStr, `MyCrate backup — ${new Date().toISOString()}`, onProgress);
-    return { crateCount: payload.collection?.items?.length||0, wantCount: payload.wantlist?.items?.length||0 };
   }
 
   function tracklistsPathFor(mainPath){
@@ -4223,15 +4230,23 @@
     return idx === -1 ? 'tracklists.json' : trimmed.slice(0, idx+1) + 'tracklists.json';
   }
 
-  // Own file, own commit, independent of the main backup — see
-  // docs/arkitektur.md, Beslutning 3. Only called when there's actually
-  // something cached, so a collection with no backfilled tracklists yet
-  // doesn't push an empty file.
-  async function githubPushTracklists(onProgress){
-    const path = tracklistsPathFor(ghPath.value.trim());
-    const payload = { myCrateTracklists: 1, exportedAt: new Date().toISOString(), tracklists: trackDataCache };
-    await githubPushFile(path, JSON.stringify(payload), `MyCrate tracklists — ${new Date().toISOString()}`, onProgress);
-    return { trackCount: Object.keys(trackDataCache).length };
+  // Pushes mycrate-backup.json, plus tracklists.json in the SAME commit
+  // whenever there's something cached to write — see docs/arkitektur.md,
+  // Beslutning 3, for why they're still two separate files (different
+  // change cadence) despite sharing one commit (avoiding the ref race
+  // above). A collection with no backfilled tracklists yet just pushes the
+  // one file, same as before this existed.
+  async function githubPush(onProgress){
+    const path = ghPath.value.trim() || 'mycrate-backup.json';
+    const payload = await buildBackupPayload();
+    const files = [{ path, jsonStr: JSON.stringify(payload) }];
+    const trackCount = Object.keys(trackDataCache).length;
+    if(trackCount){
+      const tracklistsPayload = { myCrateTracklists: 1, exportedAt: new Date().toISOString(), tracklists: trackDataCache };
+      files.push({ path: tracklistsPathFor(path), jsonStr: JSON.stringify(tracklistsPayload) });
+    }
+    await githubPushFiles(files, `MyCrate backup — ${new Date().toISOString()}`, onProgress);
+    return { crateCount: payload.collection?.items?.length||0, wantCount: payload.wantlist?.items?.length||0, trackCount };
   }
 
   // Shared by githubPull and githubPullTracklists — fetches and JSON-parses
@@ -4341,15 +4356,8 @@
     rememberGhFields();
     ghPushBtn.disabled = true; ghPullBtn.disabled = true;
     try{
-      const { crateCount, wantCount } = await githubPush(msg => ghNote.innerHTML = msg);
-      // Separate file, separate commit (docs/arkitektur.md Beslutning 3) —
-      // only pushed when there's actually something cached locally.
-      let trackNote = '';
-      const trackCount = Object.keys(trackDataCache).length;
-      if(trackCount){
-        await githubPushTracklists(msg => ghNote.innerHTML = msg);
-        trackNote = ` Tracklists for ${trackCount} releases pushed to tracklists.json.`;
-      }
+      const { crateCount, wantCount, trackCount } = await githubPush(msg => ghNote.innerHTML = msg);
+      const trackNote = trackCount ? ` Tracklists for ${trackCount} releases pushed to tracklists.json (same commit).` : '';
       ghNote.innerHTML = `Pushed just now — ${crateCount} crate records, ${wantCount} wantlist items.${trackNote}`;
     }catch(err){
       ghNote.innerHTML = `<span style="color:var(--rust)">${escapeHtml(err.message)}</span>`;
